@@ -1,23 +1,28 @@
 use crate::helpers::{self, traits::ToAnyhow};
 use anyhow::{ensure, Result};
-use ark_ff::Field;
+use ark_ff::PrimeField;
 use ark_r1cs_std::{
     prelude::{AllocVar, Boolean},
     select::CondSelectGadget,
     uint32::UInt32,
     uint8::UInt8,
-    ToBitsGadget,
 };
+use ark_r1cs_std::convert::ToBitsGadget;
 use ark_relations::r1cs::ConstraintSystemRef;
 use collect_slice::CollectSlice;
-use simpleworks::gadgets::traits::{BitwiseOperationGadget, ByteRotationGadget};
+use core::ops::BitXor;
+
+fn rotate_left_4<F: PrimeField>(mut a: [UInt8<F>; 4], by: usize) -> [UInt8<F>; 4] {
+    a.rotate_left(by % 4);
+    a
+}
 
 /// This function returns the derived keys from the secret key.
 /// Because AES 128 consists of 11 rounds, the result are 11 128-bit keys,
 /// which we represent as 4 32-bit words, so we compute 44 32-bit elements
 /// W_0, W_1, ..., W_43. The first four constitute the first round key, the
 /// second four the second one, and so on.
-pub fn derive_keys<F: Field>(
+pub fn derive_keys<F: PrimeField>(
     secret_key: &[UInt8<F>],
     lookup_table: &[UInt8<F>],
     constraint_system: ConstraintSystemRef<F>,
@@ -90,23 +95,23 @@ pub fn derive_keys<F: Field>(
                 lookup_table,
             )?)?;
 
-            let mut res = (result
+            let mut res = result
                 .get(i - 4)
                 .to_anyhow("Error getting elem")?
-                .xor(&substituted_and_rotated))?;
+                .bitxor(&substituted_and_rotated);
 
-            res = res.xor(
+            res = res.bitxor(
                 round_constants
                     .get(i / 4 - 1)
                     .to_anyhow("Error getting elem")?,
-            )?;
+            );
 
             result.push(res);
         } else {
             let res = result
                 .get(i - 4)
                 .to_anyhow("Error getting elem")?
-                .xor(result.get(i - 1).to_anyhow("Error getting elem")?)?;
+                .bitxor(result.get(i - 1).to_anyhow("Error getting elem")?);
 
             result.push(res);
         }
@@ -117,7 +122,7 @@ pub fn derive_keys<F: Field>(
     for elem in result.chunks_mut(4) {
         let mut round_key = vec![];
         for u32_value in elem {
-            let bytes = to_bytes_be(u32_value);
+            let bytes = to_bytes_be(u32_value)?;
             for byte in bytes {
                 round_key.push(byte);
             }
@@ -128,7 +133,7 @@ pub fn derive_keys<F: Field>(
     Ok(ret)
 }
 
-fn substitute_word<F: Field>(
+fn substitute_word<F: PrimeField>(
     input: &[UInt8<F>],
     lookup_table: &[UInt8<F>],
 ) -> Result<[UInt8<F>; 4]> {
@@ -166,7 +171,7 @@ fn substitute_word<F: Field>(
     ])
 }
 
-fn rotate_word<F: Field>(
+fn rotate_word<F: PrimeField>(
     input: &UInt32<F>,
     constraint_system: ConstraintSystemRef<F>,
 ) -> Result<[UInt8<F>; 4]> {
@@ -177,27 +182,31 @@ fn rotate_word<F: Field>(
         UInt8::<F>::constant(0),
     ];
 
-    for (word_to_rotate_byte, input_byte) in word_to_rotate.iter_mut().zip(to_bytes_be(input)) {
+    for (word_to_rotate_byte, input_byte) in
+        word_to_rotate.iter_mut().zip(to_bytes_be(input)?)
+    {
         *word_to_rotate_byte = input_byte;
     }
 
-    word_to_rotate.rotate_left(1, constraint_system)
+    let _ = constraint_system;
+    Ok(rotate_left_4(word_to_rotate, 1))
 }
 
 // It's either this or forking `r1cs-std`.
-fn to_bytes_be<F: Field>(input: &UInt32<F>) -> Vec<UInt8<F>> {
-    let mut bits = input.to_bits_le();
+fn to_bytes_be<F: PrimeField>(input: &UInt32<F>) -> Result<Vec<UInt8<F>>> {
+    let mut bits = input.to_bits_le()?;
     bits.reverse();
 
-    bits.chunks_mut(8)
+    Ok(bits
+        .chunks_mut(8)
         .map(|chunk| {
             chunk.reverse();
             UInt8::<F>::from_bits_le(chunk)
         })
-        .collect()
+        .collect())
 }
 
-fn to_u32<F: Field>(value: &[UInt8<F>]) -> Result<UInt32<F>> {
+fn to_u32<F: PrimeField>(value: &[UInt8<F>]) -> Result<UInt32<F>> {
     ensure!(value.len() == 4, "Invalid length for u32");
 
     let mut bits = [Boolean::<F>::FALSE; 32];
@@ -211,7 +220,7 @@ fn to_u32<F: Field>(value: &[UInt8<F>]) -> Result<UInt32<F>> {
     Ok(UInt32::<F>::from_bits_le(&bits))
 }
 
-pub fn add_round_key<F: Field>(
+pub fn add_round_key<F: PrimeField>(
     input: &[UInt8<F>],
     round_key: &[UInt8<F>],
 ) -> Result<Vec<UInt8<F>>> {
@@ -227,12 +236,7 @@ pub fn add_round_key<F: Field>(
     let output = input
         .iter()
         .zip(round_key)
-        .filter_map(|(input_text_byte, round_key_byte)| {
-            input_text_byte
-                .xor(round_key_byte)
-                .to_anyhow("Error adding round key")
-                .ok()
-        })
+        .map(|(input_text_byte, round_key_byte)| input_text_byte.bitxor(round_key_byte))
         .collect::<Vec<UInt8<F>>>();
 
     ensure!(output.len() == 16, "Error adding round key");
@@ -240,14 +244,14 @@ pub fn add_round_key<F: Field>(
     Ok(output)
 }
 
-fn substitute_byte<F: Field>(byte: &UInt8<F>, lookup_table: &[UInt8<F>]) -> Result<UInt8<F>> {
+fn substitute_byte<F: PrimeField>(byte: &UInt8<F>, lookup_table: &[UInt8<F>]) -> Result<UInt8<F>> {
     Ok(UInt8::<F>::conditionally_select_power_of_two_vector(
         &byte.to_bits_be()?,
         lookup_table,
     )?)
 }
 
-pub fn substitute_bytes<F: Field>(
+pub fn substitute_bytes<F: PrimeField>(
     bytes: &[UInt8<F>],
     lookup_table: &[UInt8<F>],
 ) -> Result<Vec<UInt8<F>>> {
@@ -265,7 +269,7 @@ pub fn substitute_bytes<F: Field>(
     Ok(substituted_bytes)
 }
 
-pub fn shift_rows<F: Field>(
+pub fn shift_rows<F: PrimeField>(
     bytes: &[UInt8<F>],
     constraint_system: ConstraintSystemRef<F>,
 ) -> Option<Vec<UInt8<F>>> {
@@ -307,9 +311,10 @@ pub fn shift_rows<F: Field>(
         bytes.get(15)?.clone(),
     ];
 
-    let rotated_second_row = second_row.rotate_left(1, constraint_system.clone()).ok()?;
-    let rotated_third_row = third_row.rotate_left(2, constraint_system.clone()).ok()?;
-    let rotated_fourth_row = fourth_row.rotate_left(3, constraint_system).ok()?;
+    let _ = constraint_system;
+    let rotated_second_row = rotate_left_4(second_row, 1);
+    let rotated_third_row = rotate_left_4(third_row, 2);
+    let rotated_fourth_row = rotate_left_4(fourth_row, 3);
 
     let result = vec![
         first_row.get(0)?.clone(),
@@ -333,7 +338,7 @@ pub fn shift_rows<F: Field>(
     Some(result)
 }
 
-pub fn mix_columns<F: Field>(
+pub fn mix_columns<F: PrimeField>(
     input: &[UInt8<F>],
     constraint_system: ConstraintSystemRef<F>,
 ) -> Option<Vec<UInt8<F>>> {
@@ -357,7 +362,7 @@ pub fn mix_columns<F: Field>(
 }
 
 // TODO: this function should return a result.
-fn gmix_column<F: Field>(
+fn gmix_column<F: PrimeField>(
     input: &[UInt8<F>; 4],
     constraint_system: ConstraintSystemRef<F>,
 ) -> Option<[UInt8<F>; 4]> {
@@ -365,64 +370,49 @@ fn gmix_column<F: Field>(
 
     for c in input.iter() {
         // TODO: Refactor this when and() is implemented for UInt8::<F>.
-        let h_bits = c
-            .shift_right(7, constraint_system.clone())
-            .ok()?
-            .to_bits_le()
-            .ok()?
-            .iter()
-            .zip(UInt8::<F>::constant(1).to_bits_le().ok()?)
-            .filter_map(|(a, b)| a.and(&b).ok())
-            .collect::<Vec<Boolean<F>>>();
-        let h = UInt8::<F>::from_bits_le(&h_bits);
-        let partial_b_byte = c.shift_left(1, constraint_system.clone()).ok()?;
-        let b_byte = partial_b_byte
-            .xor(
-                &helpers::multiply(&h, &UInt8::<F>::constant(0x1B), constraint_system.clone())
-                    .ok()?,
-            )
-            .ok()?;
+        let mut c_bits = c.to_bits_le().ok()?;
+        let msb = c_bits.get(7)?.clone();
+        c_bits.insert(0, Boolean::<F>::FALSE);
+        c_bits.truncate(8);
+        let partial_b_byte = UInt8::<F>::from_bits_le(&c_bits);
+        let h = UInt8::<F>::from_bits_le(&[
+            msb.clone(),
+            Boolean::<F>::FALSE,
+            Boolean::<F>::FALSE,
+            Boolean::<F>::FALSE,
+            Boolean::<F>::FALSE,
+            Boolean::<F>::FALSE,
+            Boolean::<F>::FALSE,
+            Boolean::<F>::FALSE,
+        ]);
+        let b_byte = partial_b_byte.bitxor(
+            &helpers::multiply(&h, &UInt8::<F>::constant(0x1B), constraint_system.clone()).ok()?,
+        );
 
         b.push(b_byte);
     }
 
     Some([
         b.first()?
-            .xor(input.get(3)?)
-            .ok()?
-            .xor(input.get(2)?)
-            .ok()?
-            .xor(b.get(1)?)
-            .ok()?
-            .xor(input.get(1)?)
-            .ok()?,
+            .bitxor(input.get(3)?)
+            .bitxor(input.get(2)?)
+            .bitxor(b.get(1)?)
+            .bitxor(input.get(1)?),
         b.get(1)?
-            .xor(input.first()?)
-            .ok()?
-            .xor(input.get(3)?)
-            .ok()?
-            .xor(b.get(2)?)
-            .ok()?
-            .xor(input.get(2)?)
-            .ok()?,
+            .bitxor(input.first()?)
+            .bitxor(input.get(3)?)
+            .bitxor(b.get(2)?)
+            .bitxor(input.get(2)?),
         b.get(2)?
-            .xor(input.get(1)?)
-            .ok()?
-            .xor(input.first()?)
-            .ok()?
-            .xor(b.get(3)?)
-            .ok()?
-            .xor(input.get(3)?)
-            .ok()?,
+            .bitxor(input.get(1)?)
+            .bitxor(input.first()?)
+            .bitxor(b.get(3)?)
+            .bitxor(input.get(3)?),
         b.get(3)?
-            .xor(input.get(2)?)
-            .ok()?
-            .xor(input.get(1)?)
-            .ok()?
-            .xor(b.first()?)
-            .ok()?
-            .xor(input.first()?)
-            .ok()?,
+            .bitxor(input.get(2)?)
+            .bitxor(input.get(1)?)
+            .bitxor(b.first()?)
+            .bitxor(input.first()?),
     ])
 }
 
@@ -430,7 +420,7 @@ fn gmix_column<F: Field>(
 // vec![...] there would be a huge stack allocation that, among other things,
 // would make compilation (yes, compilation) incredibly slow.
 #[allow(clippy::vec_init_then_push)]
-pub fn lookup_table<F: Field>(cs: ConstraintSystemRef<F>) -> Result<Vec<UInt8<F>>> {
+pub fn lookup_table<F: PrimeField>(cs: ConstraintSystemRef<F>) -> Result<Vec<UInt8<F>>> {
     let mut ret = vec![];
 
     ret.push(UInt8::<F>::new_constant(cs.clone(), 0x63)?);
@@ -696,29 +686,34 @@ pub fn lookup_table<F: Field>(cs: ConstraintSystemRef<F>) -> Result<Vec<UInt8<F>
 #[cfg(test)]
 mod tests {
     use crate::aes_circuit;
-    use ark_r1cs_std::{prelude::AllocVar, R1CSVar};
+    use ark_bls12_377::Fr;
+    use ark_r1cs_std::{prelude::AllocVar, uint8::UInt8, R1CSVar};
     use ark_relations::r1cs::ConstraintSystem;
-    use simpleworks::gadgets::{ConstraintF, UInt8Gadget};
+
+    fn witness_vec(cs: &ConstraintSystem<Fr>::Ref, bytes: &[u8]) -> Vec<UInt8<Fr>> {
+        bytes
+            .iter()
+            .map(|b| UInt8::<Fr>::new_witness(cs.clone(), || Ok(b)).unwrap())
+            .collect()
+    }
 
     #[test]
     fn test_one_round_add_round_key_circuit() {
-        let cs = ConstraintSystem::<ConstraintF>::new_ref();
-        let plaintext = UInt8Gadget::new_witness_vec(
-            ark_relations::ns!(cs, "plaintext"),
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        let plaintext = witness_vec(
+            &cs,
             &[
                 0x32, 0x43, 0xf6, 0xa8, 0x88, 0x5a, 0x30, 0x8d, 0x31, 0x31, 0x98, 0xa2, 0xe0, 0x37,
                 0x07, 0x34,
             ],
-        )
-        .unwrap();
-        let secret_key = UInt8Gadget::new_witness_vec(
-            ark_relations::ns!(cs, "secret_key"),
+        );
+        let secret_key = witness_vec(
+            &cs,
             &[
                 0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
                 0x4f, 0x3c,
             ],
-        )
-        .unwrap();
+        );
         let expected_primitive_result = [
             0x19, 0x3d, 0xe3, 0xbe, 0xa0, 0xf4, 0xe2, 0x2b, 0x9a, 0xc6, 0x8d, 0x2a, 0xe9, 0xf8,
             0x48, 0x08,
@@ -735,15 +730,14 @@ mod tests {
 
     #[test]
     fn test_one_round_column_mix_circuit() {
-        let cs = ConstraintSystem::<ConstraintF>::new_ref();
-        let value_to_mix = UInt8Gadget::new_witness_vec(
-            ark_relations::ns!(cs, "value_to_mix"),
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        let value_to_mix = witness_vec(
+            &cs,
             &[
                 0xd4, 0xbf, 0x5d, 0x30, 0xe0, 0xb4, 0x52, 0xae, 0xb8, 0x41, 0x11, 0xf1, 0x1e, 0x27,
                 0x98, 0xe5,
             ],
-        )
-        .unwrap();
+        );
         let expected_primitive_mixed_value: [u8; 16] = [
             0x04, 0x66, 0x81, 0xe5, 0xe0, 0xcb, 0x19, 0x9a, 0x48, 0xf8, 0xd3, 0x7a, 0x28, 0x06,
             0x26, 0x4c,
@@ -760,16 +754,16 @@ mod tests {
 
     #[test]
     fn test_shift_rows() {
-        let cs = ConstraintSystem::<ConstraintF>::new_ref();
+        let cs = ConstraintSystem::<Fr>::new_ref();
         // Generate random 16 bytes, and then check
         // that the AES shifting works like expected.
         let mut value_to_shift = vec![];
         for _i in 0_i32..16_i32 {
             value_to_shift
-                .push(UInt8Gadget::new_witness(cs.clone(), || Ok(rand::random::<u8>())).unwrap());
+                .push(UInt8::<Fr>::new_witness(cs.clone(), || Ok(rand::random::<u8>())).unwrap());
         }
 
-        let expected: Vec<&UInt8Gadget> = vec![
+        let expected: Vec<&UInt8<Fr>> = vec![
             value_to_shift.get(0).unwrap(),
             value_to_shift.get(5).unwrap(),
             value_to_shift.get(10).unwrap(),
@@ -797,16 +791,15 @@ mod tests {
 
     #[test]
     fn test_one_round_sub_bytes_circuit() {
-        let cs = ConstraintSystem::<ConstraintF>::new_ref();
+        let cs = ConstraintSystem::<Fr>::new_ref();
         let lookup_table = aes_circuit::lookup_table(cs.clone()).unwrap();
-        let value_to_substitute = UInt8Gadget::new_witness_vec(
-            ark_relations::ns!(cs, "value_to_mix"),
+        let value_to_substitute = witness_vec(
+            &cs,
             &[
                 0x19, 0x3d, 0xe3, 0xbe, 0xa0, 0xf4, 0xe2, 0x2b, 0x9a, 0xc6, 0x8d, 0x2a, 0xe9, 0xf8,
                 0x48, 0x08,
             ],
-        )
-        .unwrap();
+        );
 
         let expected_primitive_substituted_value: [u8; 16] = [
             0xd4, 0x27, 0x11, 0xae, 0xe0, 0xbf, 0x98, 0xf1, 0xb8, 0xb4, 0x5d, 0xe5, 0x1e, 0x41,
@@ -824,16 +817,15 @@ mod tests {
 
     #[test]
     fn key_expansion_circuit() {
-        let cs = ConstraintSystem::<ConstraintF>::new_ref();
+        let cs = ConstraintSystem::<Fr>::new_ref();
         let lookup_table = aes_circuit::lookup_table(cs.clone()).unwrap();
-        let secret_key = UInt8Gadget::new_witness_vec(
-            cs.clone(),
+        let secret_key = witness_vec(
+            &cs,
             &[
                 0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
                 0x4f, 0x3c,
             ],
-        )
-        .unwrap();
+        );
         let result = aes_circuit::derive_keys(&secret_key, &lookup_table, cs).unwrap();
 
         assert_eq!(

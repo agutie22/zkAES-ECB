@@ -1,14 +1,14 @@
 use crate::helpers::traits::ToAnyhow;
 use anyhow::{anyhow, Result};
-use ark_ff::Field;
-use ark_r1cs_std::{prelude::Boolean, uint8::UInt8, R1CSVar, ToBitsGadget};
+use ark_ff::PrimeField;
+use ark_r1cs_std::{convert::ToBitsGadget, prelude::Boolean, uint8::UInt8, R1CSVar};
 use ark_relations::r1cs::ConstraintSystemRef;
 use log::debug;
-use simpleworks::gadgets::{traits::BitwiseOperationGadget, ConstraintF};
+use core::ops::{BitAnd, BitOr, BitXor};
 
 pub mod traits;
 
-pub fn add<F: Field>(augend: &UInt8<F>, addend: &UInt8<F>) -> Result<UInt8<F>> {
+pub fn add<F: PrimeField>(augend: &UInt8<F>, addend: &UInt8<F>) -> Result<UInt8<F>> {
     let augend = augend.to_bits_be()?;
     let addend = addend.to_bits_be()?;
     let mut sum = vec![Boolean::<F>::FALSE; augend.len()];
@@ -28,20 +28,39 @@ pub fn add<F: Field>(augend: &UInt8<F>, addend: &UInt8<F>) -> Result<UInt8<F>> {
         //        = augend_bit ^ addend_bit ^ carry
         *sum.get_mut(i)
             .ok_or_else(|| anyhow!("Error accessing the index of sum"))? =
-            carry.xor(augend_bit)?.xor(&addend_bit)?;
+            carry
+                .clone()
+                .bitxor(augend_bit)
+                .bitxor(&addend_bit);
         // To simplify things, the variable carry acts for both the carry in and
         // the carry out.
         // The carry out is augend & addend when the carry in is 0, and it is
         // augend | addend when the carry in is 1.
         // carry = carry.not()
-        carry = (carry.not().and(&(augend_bit.and(&addend_bit)?))?)
-            .or(&(carry.and(&(augend_bit.or(&addend_bit)?))?))?;
+        let a_and_b = augend_bit.bitand(&addend_bit);
+        let a_xor_b = augend_bit.bitxor(&addend_bit);
+        let carry_and_axb = carry.clone().bitand(&a_xor_b);
+        carry = a_and_b.bitor(&carry_and_axb);
     }
     sum.reverse();
     Ok(UInt8::<F>::from_bits_le(&sum))
 }
 
-pub fn multiply<F: Field>(
+fn shl_u8<F: PrimeField>(
+    value: &UInt8<F>,
+    by: usize,
+    _constraint_system: ConstraintSystemRef<F>,
+) -> Result<UInt8<F>> {
+    if by == 0 {
+        return Ok(value.clone());
+    }
+    let mut bits = value.to_bits_le()?;
+    bits.splice(0..0, core::iter::repeat(Boolean::<F>::FALSE).take(by));
+    bits.truncate(8);
+    Ok(UInt8::<F>::from_bits_le(&bits))
+}
+
+pub fn multiply<F: PrimeField>(
     multiplicand: &UInt8<F>,
     multiplier: &UInt8<F>,
     constraint_system: ConstraintSystemRef<F>,
@@ -52,7 +71,7 @@ pub fn multiply<F: Field>(
         // If the divisor bit is a 1.
         if multiplier_bit.value()? {
             let addend = if i != 0 {
-                multiplicand.shift_left(i, constraint_system.clone())?
+                shl_u8(multiplicand, i, constraint_system.clone())?
             } else {
                 multiplicand.clone()
             };
@@ -63,7 +82,7 @@ pub fn multiply<F: Field>(
     Ok(product)
 }
 
-pub fn debug_constraint_system_status<F: Field>(
+pub fn debug_constraint_system_status<F: PrimeField>(
     message: &str,
     constraint_system: ConstraintSystemRef<F>,
 ) -> Result<()> {
@@ -81,7 +100,7 @@ pub fn debug_constraint_system_status<F: Field>(
     Ok(())
 }
 
-pub fn byte_to_field_array(byte: u8) -> Vec<ConstraintF> {
+pub fn byte_to_field_array(byte: u8) -> Vec<crate::Fr> {
     let mut ret = vec![];
 
     for i in 0_i32..8_i32 {

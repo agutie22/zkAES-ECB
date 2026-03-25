@@ -4,8 +4,17 @@ use aes::{
 };
 use anyhow::Result;
 use digest::generic_array::GenericArray;
+
+#[cfg(feature = "simpleworks-marlin")]
 use zk_aes::{encrypt, synthesize_keys, verify_encryption};
 
+#[cfg(not(feature = "simpleworks-marlin"))]
+fn main() -> Result<()> {
+    eprintln!("Binary requires feature `simpleworks-marlin` (Marlin glue is disabled by default).");
+    Ok(())
+}
+
+#[cfg(feature = "simpleworks-marlin")]
 fn main() -> Result<()> {
     env_logger::init();
     let message = [1_u8; 16];

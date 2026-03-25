@@ -4,6 +4,7 @@ use ark_ed_on_bls12_381::Fq;
 use ark_r1cs_std::prelude::*;
 use ark_r1cs_std::uint32::UInt32;
 use ark_relations::r1cs::ConstraintSystemRef;
+use core::ops::BitXor;
 
 pub fn xor(x: u32, y: u32, cs: &ConstraintSystemRef<Fq>) -> Result<u32> {
     let x_witness = UInt32::new_witness(ark_relations::ns!(cs, "x_xor_witness"), || Ok(x))
@@ -11,8 +12,7 @@ pub fn xor(x: u32, y: u32, cs: &ConstraintSystemRef<Fq>) -> Result<u32> {
     let y_witness = UInt32::new_witness(ark_relations::ns!(cs, "y_xor_witness"), || Ok(y))
         .to_anyhow("Error allocating an UInt32 witness")?;
     x_witness
-        .xor(&y_witness)
-        .to_anyhow("Error computing xor")?
+        .bitxor(&y_witness)
         .value()
         .to_anyhow("Error getting the result value of an xor operation")
 }
@@ -22,7 +22,7 @@ pub fn add(x: u32, y: u32, cs: &ConstraintSystemRef<Fq>) -> Result<u32> {
         .to_anyhow("Error allocating an UInt32 witness")?;
     let y_witness = UInt32::new_witness(ark_relations::ns!(cs, "y_add_witness"), || Ok(y))
         .to_anyhow("Error allocating an UInt32 witness")?;
-    UInt32::addmany(&[x_witness, y_witness])
+    UInt32::wrapping_add_many(&[x_witness, y_witness])
         .to_anyhow("Error adding witnesses")?
         .value()
         .to_anyhow("Error getting the value of an addmany operation")

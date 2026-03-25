@@ -10,20 +10,17 @@ opt-level = 3
 debug-assertions = true
 
 [dependencies]
-ark-ff = { version = "^0.3.0", default-features = false }
-ark-ec = { version = "^0.3.0", default-features = false }
-ark-bls12-377 = { version = "^0.3.0", default-features = false, features = ["curve"] }
-ark-ed-on-bls12-381 = { version = "^0.3.0", features = ["r1cs"] }
-ark-bls12-381 = { version = "^0.3.0", default-features = false, features = ["curve"] }
-ark-std = { version = "^0.3.0", default-features = false }
-ark-relations = { version = "^0.3.0", default-features = false  }
-ark-poly = { version = "^0.3.0", default-features = false  }
-ark-poly-commit = { version = "^0.3.0", default-features = false  }
-ark-r1cs-std = { version = "^0.3.0", default-features = false }
-ark-snark = { version = "^0.3.0", default-features = false }
-ark-serialize = { version = "^0.3.0", default-features = false }
-ark-crypto-primitives = { version = "^0.3.0", default-features = true, features = [ "r1cs" ] }
-simpleworks = {git = "https://github.com/Lambdaclass/simpleworks"}
+ark-ff = { version = "^0.5.0", default-features = false }
+ark-ec = { version = "^0.5.0", default-features = false }
+ark-bls12-377 = { version = "^0.5.0", default-features = false, features = ["curve"] }
+ark-ed-on-bls12-381 = { version = "^0.5.0", features = ["r1cs"] }
+ark-bls12-381 = { version = "^0.5.0", default-features = false, features = ["curve"] }
+ark-std = { version = "^0.5.0", default-features = false }
+ark-relations = { version = "^0.5.0", default-features = false }
+ark-r1cs-std = { version = "^0.5.0", default-features = false }
+ark-snark = { version = "^0.5.0", default-features = false }
+ark-serialize = { version = "^0.5.0", default-features = false, features = ["derive"] }
+ark-crypto-primitives = { version = "^0.5.0", default-features = true, features = [ "r1cs" ] }
 digest = { version = "0.9", default-features = false }
 rand_chacha = {version = "0.3.1"}
 anyhow = "1.0"
@@ -65,3 +62,4 @@ snarkvm_backend = []
 vmtropy_backend_flamegraph = ["benchmark_flamegraph"]
 vmtropy_backend = []
 benchmark_flamegraph = []
+simpleworks-marlin = []

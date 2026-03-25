@@ -45,18 +45,28 @@ pub mod ops;
 
 use anyhow::{anyhow, Result};
 pub use ark_bls12_377::Fr;
-use ark_ff::Field;
+use ark_ff::PrimeField;
 use ark_r1cs_std::{eq::EqGadget, prelude::AllocVar, uint8::UInt8, R1CSVar};
-use ark_relations::r1cs::{ConstraintSystem, ConstraintSystemRef};
-use helpers::{byte_to_field_array, traits::ToAnyhow};
+use ark_relations::r1cs::ConstraintSystemRef;
+use helpers::traits::ToAnyhow;
+
+#[cfg(feature = "simpleworks-marlin")]
+use ark_relations::r1cs::ConstraintSystem;
+#[cfg(feature = "simpleworks-marlin")]
+use helpers::byte_to_field_array;
+#[cfg(feature = "simpleworks-marlin")]
 pub use simpleworks::marlin::{generate_rand, serialization::deserialize_proof};
+#[cfg(feature = "simpleworks-marlin")]
 use simpleworks::{
     gadgets::ConstraintF,
     marlin::{MarlinProof, ProvingKey, VerifyingKey},
 };
+#[cfg(feature = "simpleworks-marlin")]
 use std::cell::RefCell;
+#[cfg(feature = "simpleworks-marlin")]
 use std::rc::Rc;
 
+#[cfg(feature = "simpleworks-marlin")]
 pub fn encrypt(
     message: &[u8],
     secret_key: &[u8; 16],
@@ -113,6 +123,7 @@ pub fn encrypt(
     Ok(proof)
 }
 
+#[cfg(feature = "simpleworks-marlin")]
 pub fn verify_encryption(
     verifying_key: VerifyingKey,
     proof: &MarlinProof,
@@ -135,6 +146,7 @@ pub fn verify_encryption(
     )
 }
 
+#[cfg(feature = "simpleworks-marlin")]
 pub fn synthesize_keys(plaintext_length: usize) -> Result<(ProvingKey, VerifyingKey)> {
     let rng = &mut simpleworks::marlin::generate_rand();
     // This parameters support encrypting messages up to 1kb length.
@@ -173,7 +185,7 @@ pub fn synthesize_keys(plaintext_length: usize) -> Result<(ProvingKey, Verifying
     simpleworks::marlin::generate_proving_and_verifying_keys(&universal_srs, constraint_system)
 }
 
-pub fn encrypt_and_generate_constraints<F: Field>(
+pub fn encrypt_and_generate_constraints<F: PrimeField>(
     message: &[UInt8<F>],
     secret_key: &[UInt8<F>],
     constraint_system: ConstraintSystemRef<F>,
