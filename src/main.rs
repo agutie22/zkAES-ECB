@@ -15,6 +15,9 @@ fn main() -> Result<()> {
     let circuit_ciphertext = zk_aes::encrypt_circuit_only(&message, &secret_key)?;
     assert_eq!(primitive_ciphertext, circuit_ciphertext);
 
+    let ok = zk_aes::spartan::prove_and_verify(&message, &secret_key, &primitive_ciphertext)?;
+    assert!(ok);
+
     Ok(())
 }
 

@@ -2,7 +2,7 @@
 
 ZK-Snark circuit to prove that a given ciphertext is the correct `AES-128` encryption using a certain secret key.
 
-This first iteration uses ECB as the mode of operation and `Marlin` as the proving system for the circuit. In the future we will support CBC and GCM as alternative modes and `Plonk` as an alternative proving system.
+This iteration uses ECB as the mode of operation. The circuit is implemented with **Arkworks 0.5** (`ark-relations` / `ark-r1cs-std`). For a **transparent** proof system, the repo includes a bridge from Arkworks’ extracted R1CS matrices to **Spartan** via the **`ark-spartan`** crate (git dependency), see `src/spartan.rs` and `cargo run` in `src/main.rs`.
 
 ## Circuit Inputs
 
@@ -15,38 +15,12 @@ This first iteration uses ECB as the mode of operation and `Marlin` as the provi
 - `ciphertext`: The encrypted message. This is public as the entire point of the circuit is for a verifier to be assured that the ciphertext they were given is the correct one.
 
 ## Usage
-You can find an example usage under the `main.rs` module. Below is an explanation of it.
+You can find an example usage under `src/main.rs`.
 
-First, the proving and verifying keys must be generated. You can generate ones for testing by calling
+- **Circuit-only encryption (witness synthesis + constraints)**: `zk_aes::encrypt_circuit_only(&message, &secret_key)`
+- **Spartan prove + verify (transparent SNARK)**: `zk_aes::spartan::prove_and_verify(&message, &secret_key, &primitive_ciphertext)`
 
-```rust
-let (proving_key, verifying_key) = synthesize_keys(message_length)?;
-```
-
-where `message_length` is the length of the message to be encrypted. Underneath, this is generating some universal SRS and then deriving the keys from it. In a real world scenario, the SRS should be generated in a secure manner through some setup using MPC.
-
-With the proving key in hand, a prover calls
-
-```rust
-let message = [1_u8; 16];
-let secret_key = [0_u8; 16];
-
-let proof = encrypt(&message, &secret_key, &primitive_ciphertext, proving_key)?;
-```
-
-where `primitive_ciphertext` is a byte slice with the result of the `AES` encryption (under the example there's a helper function for it, but you can use any standard `AES` implementation).
-
-The prover then hands the resulting proof along with the ciphertext to the verifier, who calls
-
-```rust
-let result = verify_encryption(
-    verifying_key,
-    &proof,
-    &primitive_ciphertext
-)?;
-
-assert!(result);
-```
+`primitive_ciphertext` should be the output of a standard AES implementation (the example computes it with the `aes` crate).
 
 ## AES Flow
 

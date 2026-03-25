@@ -42,6 +42,7 @@ pub mod aes;
 pub mod aes_circuit;
 pub mod helpers;
 pub mod ops;
+pub mod spartan;
 
 use anyhow::{anyhow, Result};
 pub use ark_bls12_377::Fr;
