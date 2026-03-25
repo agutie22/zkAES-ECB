@@ -1,4 +1,3 @@
-use crate::helpers::traits::ToAnyhow;
 use anyhow::{anyhow, Result};
 use ark_ff::PrimeField;
 use ark_r1cs_std::{convert::ToBitsGadget, prelude::Boolean, uint8::UInt8, R1CSVar};
@@ -86,16 +85,18 @@ pub fn debug_constraint_system_status<F: PrimeField>(
     message: &str,
     constraint_system: ConstraintSystemRef<F>,
 ) -> Result<()> {
-    let matrix = constraint_system
-        .to_matrices()
-        .to_anyhow("Error converting the constraint system to matrices")?;
     debug!("CONSTRAINT SYSTEM STATUS: {message}");
-    debug!("Number of constraints: {}", matrix.num_constraints);
-    debug!("Number of variables: {}", matrix.num_instance_variables);
-    debug!("Number of witnesses: {}", matrix.num_witness_variables);
+    debug!("Number of constraints: {}", constraint_system.num_constraints());
     debug!(
-        "Number of non-zero: {}",
-        matrix.a_num_non_zero + matrix.b_num_non_zero + matrix.c_num_non_zero
+        "Number of variables: {}",
+        constraint_system.num_instance_variables()
+    );
+    debug!(
+        "Number of witnesses: {}",
+        constraint_system.num_witness_variables()
+    );
+    debug!(
+        "Number of non-zero: <unavailable on ConstraintSystemRef>"
     );
     Ok(())
 }

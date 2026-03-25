@@ -5,31 +5,15 @@ use aes::{
 use anyhow::Result;
 use digest::generic_array::GenericArray;
 
-#[cfg(feature = "simpleworks-marlin")]
-use zk_aes::{encrypt, synthesize_keys, verify_encryption};
-
-#[cfg(not(feature = "simpleworks-marlin"))]
-fn main() -> Result<()> {
-    eprintln!("Binary requires feature `simpleworks-marlin` (Marlin glue is disabled by default).");
-    Ok(())
-}
-
-#[cfg(feature = "simpleworks-marlin")]
 fn main() -> Result<()> {
     env_logger::init();
     let message = [1_u8; 16];
     let secret_key = [0_u8; 16];
     let primitive_secret_key = Aes128::new(GenericArray::from_slice(&secret_key));
-    let (proving_key, verifying_key) = synthesize_keys(message.len())?;
-
-    let proof = encrypt(&message, &secret_key, proving_key)?;
 
     let primitive_ciphertext = primitive_encrypt(&message, &primitive_secret_key);
-    assert!(verify_encryption(
-        verifying_key,
-        &proof,
-        &primitive_ciphertext
-    )?);
+    let circuit_ciphertext = zk_aes::encrypt_circuit_only(&message, &secret_key)?;
+    assert_eq!(primitive_ciphertext, circuit_ciphertext);
 
     Ok(())
 }

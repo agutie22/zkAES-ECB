@@ -47,142 +47,46 @@ use anyhow::{anyhow, Result};
 pub use ark_bls12_377::Fr;
 use ark_ff::PrimeField;
 use ark_r1cs_std::{eq::EqGadget, prelude::AllocVar, uint8::UInt8, R1CSVar};
-use ark_relations::r1cs::ConstraintSystemRef;
+use ark_relations::r1cs::{ConstraintSystem, ConstraintSystemRef};
 use helpers::traits::ToAnyhow;
 
-#[cfg(feature = "simpleworks-marlin")]
-use ark_relations::r1cs::ConstraintSystem;
-#[cfg(feature = "simpleworks-marlin")]
-use helpers::byte_to_field_array;
-#[cfg(feature = "simpleworks-marlin")]
-pub use simpleworks::marlin::{generate_rand, serialization::deserialize_proof};
-#[cfg(feature = "simpleworks-marlin")]
-use simpleworks::{
-    gadgets::ConstraintF,
-    marlin::{MarlinProof, ProvingKey, VerifyingKey},
-};
-#[cfg(feature = "simpleworks-marlin")]
-use std::cell::RefCell;
-#[cfg(feature = "simpleworks-marlin")]
-use std::rc::Rc;
+/// Circuit-only AES encryption.
+///
+/// Builds the constraint system, generates AES constraints, and returns the computed ciphertext bytes.
+pub fn encrypt_circuit_only(message: &[u8], secret_key: &[u8; 16]) -> Result<Vec<u8>> {
+    let constraint_system = ConstraintSystem::<Fr>::new_ref();
 
-#[cfg(feature = "simpleworks-marlin")]
-pub fn encrypt(
-    message: &[u8],
-    secret_key: &[u8; 16],
-    proving_key: ProvingKey,
-) -> Result<MarlinProof> {
-    let rng = &mut simpleworks::marlin::generate_rand();
-    let constraint_system = ConstraintSystem::<ConstraintF>::new_ref();
+    let message_circuit: Vec<UInt8<Fr>> = message
+        .iter()
+        .map(|byte| UInt8::<Fr>::new_witness(constraint_system.clone(), || Ok(*byte)))
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow!(e.to_owned()))?;
 
-    // TODO: These three blocks of code could be replaced with calls to `new_witness_vec` and
-    // `new_input_vec`, but for some reason that makes integration tests break??
-    let mut message_circuit: Vec<UInt8<ConstraintF>> = Vec::with_capacity(message.len());
-    for byte in message {
-        message_circuit.push(UInt8::<ConstraintF>::new_witness(
-            constraint_system.clone(),
-            || Ok(byte),
-        )?);
-    }
-    helpers::debug_constraint_system_status(
-        "After allocating the message",
-        constraint_system.clone(),
-    )?;
+    let secret_key_circuit: Vec<UInt8<Fr>> = secret_key
+        .iter()
+        .map(|byte| UInt8::<Fr>::new_witness(constraint_system.clone(), || Ok(*byte)))
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow!(e.to_owned()))?;
 
-    let mut secret_key_circuit: Vec<UInt8<ConstraintF>> = Vec::with_capacity(secret_key.len());
-    for byte in secret_key {
-        secret_key_circuit.push(UInt8::<ConstraintF>::new_witness(
-            constraint_system.clone(),
-            || Ok(byte),
-        )?);
-    }
-    helpers::debug_constraint_system_status(
-        "After allocating the secret key",
-        constraint_system.clone(),
-    )?;
-
-    encrypt_and_generate_constraints(
+    let computed = encrypt_and_generate_constraints(
         &message_circuit,
         &secret_key_circuit,
         constraint_system.clone(),
     )?;
 
-    // Here we clone the constraint system because deep down when generating
-    // the proof the constraint system is consumed and it has to have one
-    // reference for it to be consumed.
-    let cs_clone = (*constraint_system
-        .borrow()
-        .ok_or("Error borrowing")
-        .map_err(|e| anyhow!(e.to_owned()))?)
-    .clone();
-    let cs_ref_clone = ConstraintSystemRef::CS(Rc::new(RefCell::new(cs_clone)));
+    let out = computed
+        .value()
+        .map_err(|e| anyhow!(e.to_owned()))?
+        .to_vec();
 
-    helpers::debug_constraint_system_status("Before generating the proof", constraint_system)?;
-    let proof = simpleworks::marlin::generate_proof(cs_ref_clone, proving_key, rng)?;
-
-    Ok(proof)
-}
-
-#[cfg(feature = "simpleworks-marlin")]
-pub fn verify_encryption(
-    verifying_key: VerifyingKey,
-    proof: &MarlinProof,
-    ciphertext: &[u8],
-) -> Result<bool> {
-    let mut ciphertext_as_field_array = vec![];
-
-    for byte in ciphertext {
-        let field_array = byte_to_field_array(*byte);
-        for field_element in field_array {
-            ciphertext_as_field_array.push(field_element);
-        }
+    if !constraint_system
+        .is_satisfied()
+        .map_err(|e| anyhow!(e.to_owned()))?
+    {
+        return Err(anyhow!("Constraint system is not satisfied"));
     }
 
-    simpleworks::marlin::verify_proof(
-        verifying_key,
-        &ciphertext_as_field_array,
-        proof,
-        &mut simpleworks::marlin::generate_rand(),
-    )
-}
-
-#[cfg(feature = "simpleworks-marlin")]
-pub fn synthesize_keys(plaintext_length: usize) -> Result<(ProvingKey, VerifyingKey)> {
-    let rng = &mut simpleworks::marlin::generate_rand();
-    // This parameters support encrypting messages up to 1kb length.
-    let universal_srs = simpleworks::marlin::generate_universal_srs(866_944, 513, 4_062_064, rng)?;
-    let constraint_system = ConstraintSystem::<ConstraintF>::new_ref();
-
-    let default_message_input = vec![0_u8; plaintext_length];
-    let default_secret_key_input = [0_u8; 16];
-
-    // TODO: These three blocks of code could be replaced with calls to `new_witness_vec` and
-    // `new_input_vec`, but for some reason that makes integration tests break??
-    let mut message_circuit: Vec<UInt8<ConstraintF>> =
-        Vec::with_capacity(default_message_input.len());
-    for byte in default_message_input {
-        message_circuit.push(UInt8::<ConstraintF>::new_witness(
-            constraint_system.clone(),
-            || Ok(byte),
-        )?);
-    }
-
-    let mut secret_key_circuit: Vec<UInt8<ConstraintF>> =
-        Vec::with_capacity(default_secret_key_input.len());
-    for byte in default_secret_key_input {
-        secret_key_circuit.push(UInt8::<ConstraintF>::new_witness(
-            constraint_system.clone(),
-            || Ok(byte),
-        )?);
-    }
-
-    let _ciphertext = encrypt_and_generate_constraints(
-        &message_circuit,
-        &secret_key_circuit,
-        constraint_system.clone(),
-    );
-
-    simpleworks::marlin::generate_proving_and_verifying_keys(&universal_srs, constraint_system)
+    Ok(out)
 }
 
 pub fn encrypt_and_generate_constraints<F: PrimeField>(

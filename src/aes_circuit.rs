@@ -688,9 +688,9 @@ mod tests {
     use crate::aes_circuit;
     use ark_bls12_377::Fr;
     use ark_r1cs_std::{prelude::AllocVar, uint8::UInt8, R1CSVar};
-    use ark_relations::r1cs::ConstraintSystem;
+    use ark_relations::r1cs::{ConstraintSystem, ConstraintSystemRef};
 
-    fn witness_vec(cs: &ConstraintSystem<Fr>::Ref, bytes: &[u8]) -> Vec<UInt8<Fr>> {
+    fn witness_vec(cs: &ConstraintSystemRef<Fr>, bytes: &[u8]) -> Vec<UInt8<Fr>> {
         bytes
             .iter()
             .map(|b| UInt8::<Fr>::new_witness(cs.clone(), || Ok(b)).unwrap())
