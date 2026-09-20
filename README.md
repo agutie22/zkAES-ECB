@@ -1,30 +1,96 @@
 # AES Encryption circuit
 
-ZK-Snark circuit to prove that a given ciphertext is the correct `AES-128` encryption using a certain secret key.
+A zero-knowledge proof that a given ciphertext is the correct `AES-128` ECB encryption of a message under a secret key. The message and the key stay private; only the ciphertext is public.
 
-This iteration uses ECB as the mode of operation. The circuit is implemented with **Arkworks 0.5** (`ark-relations` / `ark-r1cs-std`). For a **transparent** proof system, the repo includes a bridge from Arkworks’ extracted R1CS matrices to **Spartan** via the **`ark-spartan`** crate (git dependency), see `src/spartan.rs` and `cargo run` in `src/main.rs`.
+Built on **Arkworks 0.5**. No `simpleworks`, and no `ark-marlin` — whose last release, 0.3.0, pins the whole dependency tree to a 2021 version of `ark-ff`.
+
+## The layers
+
+A SNARK over a circuit is a stack of independent pieces. Each is one module here, and each can be swapped without touching the others:
+
+| Layer | Where | What it does |
+| ----- | ----- | ------------ |
+| Field arithmetic | `ark-ff`, `ark-bls12-377` | the prime field `Fr` that everything is expressed in |
+| Gadgets | `ark-r1cs-std` | bytes and booleans as field variables, with XOR, AND, select |
+| Field extension | `src/gf256.rs` | GF(2⁸), the field AES itself is defined over |
+| Non-linear step | `src/sbox.rs` | the S-box, two ways — and ~90% of the circuit's cost |
+| Arithmetization | `src/aes_gadget.rs` | AES-128 ECB as constraints |
+| Relation | `src/circuit.rs` | what is proved: private message and key, public ciphertext |
+| Proving system | `src/backend/` | Groth16 or Spartan over that relation |
+
+Two notions of "field" meet in the middle of that table. AES is defined over GF(2⁸), with 256 elements; the proof system works over `Fr`, a prime field of about 2²⁵³ elements. The circuit does not embed one in the other — it represents each AES byte as eight `Fr` elements constrained to be 0 or 1, and rebuilds GF(2⁸) arithmetic out of XOR and AND on those bits. That is exactly why the S-box is expensive.
+
+### On PIOPs and polynomial commitments
+
+SNARKs are usually presented as a *PIOP* (an information-theoretic protocol over polynomials) compiled with a *polynomial commitment scheme*. That split is real, but it is not where these two backends draw their boundaries:
+
+- **Groth16** does not decompose this way at all. It compiles the R1CS to a QAP and checks one pairing equation against a structured reference string. The trusted setup is the price of a three-element proof.
+- **Spartan** does: a sum-check protocol over the multilinear extensions of `A`, `B`, `C`, compiled with a multilinear polynomial commitment. That is what makes it transparent. `ark-spartan` ships the two fused behind one type, so the seam is in the papers, not the API.
+
+Arkworks exposes the commitment layer on its own as `ark-poly-commit` (KZG, IPA, Ligero). Pairing it with a PIOP of your own is how you would get a stack where the two are genuinely interchangeable.
 
 ## Circuit Inputs
 
 ### Private
 
-- `message`: The message to encrypt. 
+- `message`: The message to encrypt.
 - `secret_key`: The secret key used for the AES encryption.
 
 ### Public
 - `ciphertext`: The encrypted message. This is public as the entire point of the circuit is for a verifier to be assured that the ciphertext they were given is the correct one.
 
 ## Usage
-You can find an example usage under `src/main.rs`.
 
-- **Circuit-only encryption (witness synthesis + constraints)**: `zk_aes::encrypt_circuit_only(&message, &secret_key)`
-- **Spartan prove + verify (transparent SNARK)**: `zk_aes::spartan::prove_and_verify(&message, &secret_key, &primitive_ciphertext)`
+`cargo run --release` runs the full Groth16 flow; see `src/main.rs`.
 
-`primitive_ciphertext` should be the output of a standard AES implementation (the example computes it with the `aes` crate).
+```rust
+let ciphertext = /* output of a standard AES-128 ECB implementation */;
+
+// Once per circuit shape (here, one 16-byte block).
+let (proving_key, verifying_key) = zk_aes::backend::groth16::setup(1, &mut rng)?;
+
+// Prover: knows the message and the key.
+let proof = zk_aes::backend::groth16::prove(
+    &proving_key, &message, &secret_key, &ciphertext, &mut rng,
+)?;
+
+// Verifier: sees only the verifying key, the ciphertext and the proof.
+assert!(zk_aes::backend::groth16::verify(&verifying_key, &ciphertext, &proof)?);
+```
+
+Other entry points:
+
+- **Circuit only, no proof**: `zk_aes::encrypt_circuit_only(&message, &secret_key)`
+- **Constraint count**: `zk_aes::constraint_count(num_blocks, sbox_kind)`
+- **Spartan (transparent)**: `zk_aes::backend::spartan::prove_and_verify(&message, &secret_key, &ciphertext)`
+
+Slow tests are `#[ignore]`d: run them with `cargo test --release -- --ignored`.
+
+## Numbers
+
+One 16-byte block, release build, default (bitsliced) S-box:
+
+| | | |
+| --- | --- | --- |
+| Constraints | 30,728 | was 184,928 with the lookup S-box |
+| Groth16 setup | ~0.9 s | ~4.4 s |
+| Groth16 prove | ~0.45 s | ~2.8 s |
+| Groth16 verify | ~5 ms | constant, independent of circuit size |
+
+## The S-box is the circuit
+
+`SubBytes` runs 200 times per block — 160 in the rounds, 40 in the key schedule — and everything else is nearly free: `ShiftRows` is a permutation of existing variables, `AddRoundKey` is XOR, `MixColumns` is XOR plus a doubling in GF(2⁸). So the S-box is not *a* cost, it is essentially the whole cost, and the construction you pick for it decides the size of the circuit.
+
+| S-box | Per byte | One block |
+| ----- | -------- | --------- |
+| `SboxKind::Lookup` — 256 constants walked by a conditional-select tree | 884 | 184,928 |
+| `SboxKind::Bitsliced` — Boyar-Peralta, 32 AND + 81 XOR gates | 113 | 30,728 |
+
+Both are checked against the Rijndael table on all 256 inputs. The bitsliced circuit is the depth-16 construction from Boyar and Peralta, in the form used by the `aes` crate's fixsliced software backend: it computes the GF(2⁸) inverse through a tower of subfields instead of looking it up, and every gate is one R1CS constraint.
 
 ## AES Flow
 
-`AES-128` consists of 11 rounds. The secret key is used to derive 11 round keys, one for each round. 
+`AES-128` consists of 11 rounds. The secret key is used to derive 11 round keys, one for each round.
 
 Each AES round then takes a message as input and performs the following steps:
 - `Add Round Key`
@@ -32,30 +98,19 @@ Each AES round then takes a message as input and performs the following steps:
 - `Shift Rows`
 - `Mix Columns`
 
-## Building Blocks Required
-Given the above, the building blocks required at the circuit level are the following:
-
-| Building Blocks | Required Primitives |
-| --------------- | ------------------- |
-| AddRoundKey     | `xor`               |
-| SubBytes        | conditional select  |
-| ShiftRows       | Row shifting        |
-| MixColumns      | `addmany`           |
-| KeyDerivation   | All of the above    |
+The last round skips `Mix Columns`.
 
 ### Add RoundKey
-This is just an xor of the input against the current round key.
+An XOR of the input against the current round key.
 
 ### Sub Bytes
-This is the so called [Rijndael S-Box](https://en.wikipedia.org/wiki/Rijndael_S-box), a lookup table that has a pretty complicated calculation involving [Rijndael's finite field](https://cryptohack.gitbook.io/cryptobook/symmetric-cryptography/aes/rijndael-finite-field). 
+The [Rijndael S-Box](https://en.wikipedia.org/wiki/Rijndael_S-box): inversion in [Rijndael's finite field](https://cryptohack.gitbook.io/cryptobook/symmetric-cryptography/aes/rijndael-finite-field) followed by an affine map. See above for how it is arithmetized.
 
-Inside the circuit, we implement it by instantiating the precomputed table as 256 constants and then using a conditional select operation to do the lookup.
-
-###  Shift Rows
-This step simply writes the input as a byte matrix and then rotates each row.
+### Shift Rows
+Writes the input as a byte matrix and rotates each row. Free in-circuit: it only renames variables.
 
 ### Mix Columns
-`Mix Columns` is essentially multiplying the input by a matrix, only the multiplication is once again performed in [Rijndael's finite field](https://cryptohack.gitbook.io/cryptobook/symmetric-cryptography/aes/rijndael-finite-field).
+Multiplies each column by a fixed matrix over Rijndael's field. Every entry is 1, 2 or 3, so it reduces to XORs and `gf256::xtime`.
 
 ### Key Derivation
-The key derivation is the most complex step, but it's ultimately just a combination of all the basic operations used in the four steps for every round.
+The key schedule combines all of the above, and accounts for 40 of the 200 S-box applications.

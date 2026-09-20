@@ -1,1 +1,4 @@
 target/
+
+# Cursor IDE: local session logs and tooling (do not commit)
+.cursor/

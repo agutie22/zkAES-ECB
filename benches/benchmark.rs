@@ -17,7 +17,7 @@ criterion_group! {
     targets = run_benchmarks
 }
 
-#[cfg(all(not(feature = "benchmark_flamegraph")))]
+#[cfg(not(feature = "benchmark_flamegraph"))]
 criterion_group!(benches, run_benchmarks);
 
 criterion_main!(benches);

@@ -11,27 +11,19 @@ debug-assertions = true
 
 [dependencies]
 ark-ff = { version = "^0.5.0", default-features = false }
-ark-ec = { version = "^0.5.0", default-features = false }
 ark-bls12-377 = { version = "^0.5.0", default-features = false, features = ["curve"] }
-ark-ed-on-bls12-381 = { version = "^0.5.0", features = ["r1cs"] }
-ark-bls12-381 = { version = "^0.5.0", default-features = false, features = ["curve"] }
 ark-std = { version = "^0.5.0", default-features = false }
 ark-relations = { version = "^0.5.0", default-features = false }
 ark-r1cs-std = { version = "^0.5.0", default-features = false }
 ark-snark = { version = "^0.5.0", default-features = false }
-ark-serialize = { version = "^0.5.0", default-features = false, features = ["derive"] }
-ark-crypto-primitives = { version = "^0.5.0", default-features = true, features = [ "r1cs" ] }
-ark-poly = { version = "^0.5.0", default-features = false }
-libspartan = { package = "ark-spartan", git = "https://github.com/arkworks-rs/spartan" }
+ark-groth16 = { version = "^0.5.0", default-features = false }
+libspartan = { package = "ark-spartan", git = "https://github.com/arkworks-rs/spartan", rev = "e0aff4c4b7d1ef965bc862da6ec426e162cc3de8" }
 merlin = "3.0.0"
 digest = { version = "0.9", default-features = false }
 rand_chacha = {version = "0.3.1"}
 anyhow = "1.0"
-collect_slice = "^1.2.0"
 aes = "0.8"
 rand = "0.8.5"
-log = "0.4"
-env_logger = "0.10.0"
 
 [profile.bench]
 opt-level = 3
@@ -60,8 +52,4 @@ name = "benchmark"
 harness = false
 
 [features]
-snarkvm_backend_flamegraph = ["benchmark_flamegraph"]
-snarkvm_backend = []
-vmtropy_backend_flamegraph = ["benchmark_flamegraph"]
-vmtropy_backend = []
 benchmark_flamegraph = []

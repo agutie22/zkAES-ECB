@@ -1,9 +1,10 @@
 use aes::cipher::KeyInit;
 use anyhow::{ensure, Result};
 use criterion::Criterion;
+use rand::SeedableRng;
+use rand_chacha::ChaCha20Rng;
 
 // TODO: Support non-multiple of 16 bytes messages.
-#[allow(dead_code)]
 fn primitive_encrypt(message: &[u8], key: &[u8]) -> Vec<u8> {
     let primitive_secret_key =
         aes::Aes128::new(digest::generic_array::GenericArray::from_slice(key));
@@ -30,20 +31,27 @@ fn sample_message(amount_of_bytes: usize) -> Vec<u8> {
     message
 }
 
+/// Benchmarks Groth16 proving time for a message of `amount_of_bytes` bytes.
+///
+/// The trusted setup is done once, outside the measured loop, since in practice
+/// it happens once per circuit shape and is not part of proving.
 pub fn encrypt_message_with_bytes(c: &mut Criterion, amount_of_bytes: usize) -> Result<()> {
     ensure!(
         amount_of_bytes % 16 == 0,
         "Message length in bytes should be a multiple of 16 for the moment"
     );
     let message = sample_message(amount_of_bytes);
-    let (proving_key, _verifying_key) = zk_aes::synthesize_keys(message.len()).unwrap();
     let key: [u8; 16] = rand::random();
+    let ciphertext = primitive_encrypt(&message, &key);
+
+    let mut rng = ChaCha20Rng::seed_from_u64(0_u64);
+    let (proving_key, _verifying_key) = zk_aes::backend::groth16::setup(message.len() / 16, &mut rng)?;
 
     let mut group = c.benchmark_group("Encryption");
     group.sample_size(10);
     group.bench_function(format!("{amount_of_bytes}_message_encryption"), |b| {
         b.iter(|| {
-            zk_aes::encrypt(&message, &key, proving_key.clone()).unwrap();
+            zk_aes::backend::groth16::prove(&proving_key, &message, &key, &ciphertext, &mut rng).unwrap();
         })
     });
     group.finish();

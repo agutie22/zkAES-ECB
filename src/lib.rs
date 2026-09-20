@@ -1,210 +1,107 @@
-#![warn(warnings, rust_2018_idioms)]
-#![forbid(unsafe_code)]
-#![recursion_limit = "256"]
-#![warn(
-    clippy::allow_attributes_without_reason,
-    clippy::as_conversions,
-    clippy::as_ptr_cast_mut,
-    clippy::unnecessary_cast,
-    clippy::clone_on_ref_ptr,
-    clippy::create_dir,
-    clippy::dbg_macro,
-    clippy::decimal_literal_representation,
-    clippy::default_numeric_fallback,
-    clippy::deref_by_slicing,
-    clippy::empty_structs_with_brackets,
-    clippy::float_cmp_const,
-    clippy::fn_to_numeric_cast_any,
-    clippy::indexing_slicing,
-    clippy::iter_kv_map,
-    clippy::manual_clamp,
-    clippy::manual_filter,
-    clippy::map_err_ignore,
-    clippy::uninlined_format_args,
-    clippy::unseparated_literal_suffix,
-    clippy::unused_format_specs,
-    clippy::single_char_lifetime_names,
-    clippy::str_to_string,
-    clippy::string_add,
-    clippy::string_slice,
-    clippy::string_to_string,
-    clippy::todo,
-    clippy::try_err
-)]
-#![deny(clippy::unwrap_used, clippy::expect_used)]
-#![allow(
-    clippy::module_inception,
-    clippy::module_name_repetitions,
-    clippy::let_underscore_must_use
-)]
+//! A zero-knowledge proof that a ciphertext is the AES-128 ECB encryption of a
+//! message under a secret key, with only the ciphertext made public.
+//!
+//! # The layers
+//!
+//! A SNARK over a circuit is a stack of independent pieces. Each one here is a
+//! module, and each can be replaced without touching the others:
+//!
+//! | Layer | Module | What it does |
+//! | --- | --- | --- |
+//! | Field arithmetic | `ark-ff`, `ark-bls12-377` | the prime field `Fr` everything is expressed in |
+//! | Gadgets | `ark-r1cs-std` | bytes and booleans as field variables, with XOR, AND, select |
+//! | Field extension | [`gf256`] | GF(2^8), the field AES itself is defined over |
+//! | Non-linear step | [`sbox`] | the S-box, two ways — and ~90% of the circuit's cost |
+//! | Arithmetization | [`aes_gadget`] | AES-128 ECB as constraints |
+//! | Relation | [`circuit`] | what is being proved: private message and key, public ciphertext |
+//! | Proving system | [`backend`] | Groth16 or Spartan over that relation |
+//!
+//! Two field notions meet in the middle of that table and are easy to confuse.
+//! AES is defined over GF(2^8), a 256-element field; the proof system works over
+//! `Fr`, a prime field of ~2^253 elements. The circuit does not embed one in the
+//! other: it represents each AES byte as eight `Fr` elements constrained to be
+//! 0 or 1, and rebuilds GF(2^8) arithmetic out of XOR and AND on those bits.
+//! That is why [`sbox`] is expensive and why the bitsliced form of it wins.
+//!
+//! # Usage
+//!
+//! ```no_run
+//! # use rand::SeedableRng;
+//! # let (message, secret_key, ciphertext) = ([1_u8; 16], [0_u8; 16], vec![0_u8; 16]);
+//! let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(0);
+//!
+//! let (proving_key, verifying_key) = zk_aes::backend::groth16::setup(1, &mut rng)?;
+//! let proof = zk_aes::backend::groth16::prove(
+//!     &proving_key, &message, &secret_key, &ciphertext, &mut rng,
+//! )?;
+//! assert!(zk_aes::backend::groth16::verify(&verifying_key, &ciphertext, &proof)?);
+//! # Ok::<(), anyhow::Error>(())
+//! ```
 
-pub mod aes;
-pub mod aes_circuit;
-pub mod helpers;
-pub mod ops;
-pub mod spartan;
+#![forbid(unsafe_code)]
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+#![warn(clippy::indexing_slicing, clippy::as_conversions, missing_docs)]
+
+pub mod aes_gadget;
+pub mod backend;
+pub mod circuit;
+pub mod gf256;
+pub mod sbox;
 
 use anyhow::{anyhow, Result};
+use ark_r1cs_std::{prelude::AllocVar, uint8::UInt8, R1CSVar};
+use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem, SynthesisMode};
+use circuit::AesEcbCircuit;
+use sbox::SboxKind;
+
+/// The scalar field of BLS12-377, which all constraints are expressed over.
 pub use ark_bls12_377::Fr;
-use ark_ff::PrimeField;
-use ark_r1cs_std::{eq::EqGadget, prelude::AllocVar, uint8::UInt8, R1CSVar};
-use ark_relations::r1cs::{ConstraintSystem, ConstraintSystemRef};
-use helpers::traits::ToAnyhow;
 
-/// Circuit-only AES encryption.
+/// Encrypts inside the circuit and returns the ciphertext, without proving
+/// anything.
 ///
-/// Builds the constraint system, generates AES constraints, and returns the computed ciphertext bytes.
+/// Useful to check the arithmetization against a reference AES, and to count
+/// constraints. See [`constraint_count`].
 pub fn encrypt_circuit_only(message: &[u8], secret_key: &[u8; 16]) -> Result<Vec<u8>> {
-    let constraint_system = ConstraintSystem::<Fr>::new_ref();
+    let cs = ConstraintSystem::<Fr>::new_ref();
+    let sbox = sbox::Sbox::new(SboxKind::default(), cs.clone());
 
-    let message_circuit: Vec<UInt8<Fr>> = message
+    let message_gadget: Vec<UInt8<Fr>> = message
         .iter()
-        .map(|byte| UInt8::<Fr>::new_witness(constraint_system.clone(), || Ok(*byte)))
+        .map(|byte| UInt8::<Fr>::new_witness(cs.clone(), || Ok(*byte)))
         .collect::<Result<_, _>>()
-        .map_err(|e| anyhow!(e.to_owned()))?;
-
-    let secret_key_circuit: Vec<UInt8<Fr>> = secret_key
+        .map_err(|e| anyhow!("error allocating the message: {e}"))?;
+    let key_gadget: Vec<UInt8<Fr>> = secret_key
         .iter()
-        .map(|byte| UInt8::<Fr>::new_witness(constraint_system.clone(), || Ok(*byte)))
+        .map(|byte| UInt8::<Fr>::new_witness(cs.clone(), || Ok(*byte)))
         .collect::<Result<_, _>>()
-        .map_err(|e| anyhow!(e.to_owned()))?;
+        .map_err(|e| anyhow!("error allocating the key: {e}"))?;
 
-    let computed = encrypt_and_generate_constraints(
-        &message_circuit,
-        &secret_key_circuit,
-        constraint_system.clone(),
-    )?;
+    let ciphertext = aes_gadget::encrypt(&message_gadget, &key_gadget, &sbox)
+        .map_err(|e| anyhow!("error generating constraints: {e}"))?;
 
-    let out = computed
-        .value()
-        .map_err(|e| anyhow!(e.to_owned()))?
-        .to_vec();
-
-    if !constraint_system
+    if !cs
         .is_satisfied()
-        .map_err(|e| anyhow!(e.to_owned()))?
+        .map_err(|e| anyhow!("error checking the constraint system: {e}"))?
     {
-        return Err(anyhow!("Constraint system is not satisfied"));
+        return Err(anyhow!("constraint system is not satisfied"));
     }
 
-    Ok(out)
+    ciphertext
+        .value()
+        .map_err(|e| anyhow!("error reading the ciphertext: {e}"))
 }
 
-pub fn encrypt_and_generate_constraints<F: PrimeField>(
-    message: &[UInt8<F>],
-    secret_key: &[UInt8<F>],
-    constraint_system: ConstraintSystemRef<F>,
-) -> Result<Vec<UInt8<F>>> {
-    let mut computed_ciphertext: Vec<UInt8<F>> = Vec::new();
-    let lookup_table = aes_circuit::lookup_table(constraint_system.clone())?;
-    helpers::debug_constraint_system_status(
-        "After generating the lookup table",
-        constraint_system.clone(),
-    )?;
-    let round_keys =
-        aes_circuit::derive_keys(secret_key, &lookup_table, constraint_system.clone())?;
-    helpers::debug_constraint_system_status(
-        "After deriving the round keys",
-        constraint_system.clone(),
-    )?;
+/// The number of R1CS constraints the circuit generates for `num_blocks` blocks
+/// under the given S-box.
+pub fn constraint_count(num_blocks: usize, sbox: SboxKind) -> Result<usize> {
+    let cs = ConstraintSystem::<Fr>::new_ref();
+    // The circuit carries no assignments here, only its shape.
+    cs.set_mode(SynthesisMode::Setup);
+    AesEcbCircuit::<Fr>::setup(num_blocks)
+        .with_sbox(sbox)
+        .generate_constraints(cs.clone())
+        .map_err(|e| anyhow!("error generating constraints: {e}"))?;
 
-    for block in message.chunks(16) {
-        // Round 0
-        let mut after_add_round_key = aes_circuit::add_round_key(block, secret_key)?;
-        helpers::debug_constraint_system_status(
-            "After adding round key in round 0",
-            constraint_system.clone(),
-        )?;
-        // Rounds 1 to 9
-        // Starting at 1 will skip the first round key which is the same as
-        // the secret key.
-        for round in 1_usize..=9_usize {
-            // Step 1
-            let after_substitute_bytes =
-                aes_circuit::substitute_bytes(&after_add_round_key, &lookup_table)?;
-            helpers::debug_constraint_system_status(
-                &format!("After substituting bytes in round {round}"),
-                constraint_system.clone(),
-            )?;
-            // Step 2
-            let after_shift_rows =
-                aes_circuit::shift_rows(&after_substitute_bytes, constraint_system.clone())
-                    .to_anyhow("Error shifting rows")?;
-            helpers::debug_constraint_system_status(
-                &format!("After shifting rows in round {round}"),
-                constraint_system.clone(),
-            )?;
-            // Step 3
-            let after_mix_columns =
-                aes_circuit::mix_columns(&after_shift_rows, constraint_system.clone())
-                    .to_anyhow("Error mixing columns when encrypting")?;
-            helpers::debug_constraint_system_status(
-                &format!("After mixing columns in round {round}"),
-                constraint_system.clone(),
-            )?;
-            // Step 4
-            after_add_round_key = aes_circuit::add_round_key(
-                &after_mix_columns,
-                round_keys
-                    .get(round)
-                    .to_anyhow(&format!("Error getting round key in round {round}"))?,
-            )?;
-            helpers::debug_constraint_system_status(
-                &format!("After adding round key in round {round}"),
-                constraint_system.clone(),
-            )?;
-        }
-
-        // Round 10
-        // We are hardcoding round 10 because in AES there is no need to mix
-        // columns in the last round. Besides this way we are generating less
-        // constraints.
-        // Step 1
-        let after_substitute_bytes =
-            aes_circuit::substitute_bytes(&after_add_round_key, &lookup_table)?;
-        helpers::debug_constraint_system_status(
-            "After substituting bytes in round 10",
-            constraint_system.clone(),
-        )?;
-        // Step 2
-        let after_shift_rows =
-            aes_circuit::shift_rows(&after_substitute_bytes, constraint_system.clone())
-                .to_anyhow("Error shifting rows")?;
-        helpers::debug_constraint_system_status(
-            "After shifting rows in round 10",
-            constraint_system.clone(),
-        )?;
-        // Step 3
-        after_add_round_key = aes_circuit::add_round_key(
-            &after_shift_rows,
-            round_keys
-                .get(10)
-                .to_anyhow("Error getting round key in round 10")?,
-        )?;
-        helpers::debug_constraint_system_status(
-            "After adding round key in round 10",
-            constraint_system.clone(),
-        )?;
-
-        let mut ciphertext_chunk = vec![];
-
-        for u8_gadget in after_add_round_key {
-            ciphertext_chunk.push(u8_gadget);
-        }
-
-        computed_ciphertext.extend_from_slice(&ciphertext_chunk);
-    }
-
-    // finally, we insert the computed ciphertext as a public input of the circuit
-    for byte in &computed_ciphertext {
-        let value = byte.value().map_err(|e| anyhow!(e.to_owned()))?;
-        let public_input = UInt8::<F>::new_input(constraint_system.clone(), || Ok(value))?;
-        public_input.enforce_equal(byte)?;
-    }
-    helpers::debug_constraint_system_status(
-        "After enforcing that the obtained ciphertext is equal to the given one",
-        constraint_system,
-    )?;
-
-    Ok(computed_ciphertext)
+    Ok(cs.num_constraints())
 }
