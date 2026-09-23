@@ -7,7 +7,11 @@ description = "A zero-knowledge proof of AES-128 ECB encryption, on Arkworks."
 [dependencies]
 # Constraint systems and gadgets.
 ark-ff = { version = "0.5", default-features = false }
-ark-std = { version = "0.5", default-features = false }
+# `getrandom` is a security fix, not a convenience: ark-spartan seeds the
+# blinding randomness behind its zero-knowledge from `ark_std::test_rng()`,
+# which without this feature is a hard-coded seed. See tests/zero_knowledge.rs.
+# (Setting DETERMINISTIC_TEST_RNG=1 in the environment reverts it.)
+ark-std = { version = "0.5", default-features = false, features = ["std", "getrandom"] }
 ark-relations = { version = "0.5", default-features = false }
 ark-r1cs-std = { version = "0.5", default-features = false }
 ark-bls12-377 = { version = "0.5", default-features = false, features = ["curve"] }
@@ -24,6 +28,7 @@ rand_chacha = "0.3"
 anyhow = "1.0"
 
 [dev-dependencies]
+ark-serialize = { version = "0.5", default-features = false }
 criterion = "0.4"
 
 [[bench]]
