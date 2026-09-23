@@ -65,15 +65,16 @@ pub use ark_bls12_377::Fr;
 /// Runs AES inside the circuit and returns the ciphertext, without proving
 /// anything. Useful to check the arithmetization against [`reference::encrypt`].
 pub fn encrypt_circuit_only(message: &[u8], secret_key: &[u8; 16]) -> Result<Vec<u8>> {
+    let (blocks, rest) = message.as_chunks::<16>();
     ensure!(
-        message.len() % 16 == 0,
+        rest.is_empty(),
         "message must be a whole number of 16-byte blocks"
     );
     let cs = ConstraintSystem::<Fr>::new_ref();
     let err = |e| anyhow!("constraint system error: {e}");
 
-    let blocks = message
-        .chunks_exact(16)
+    let blocks = blocks
+        .iter()
         .map(|block| alloc_state(&cs, Some(block), AllocationMode::Witness))
         .collect::<Result<Vec<_>, _>>()
         .map_err(err)?;

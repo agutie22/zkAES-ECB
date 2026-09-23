@@ -13,16 +13,17 @@ use aes::Aes128;
 /// If `message` is not a whole number of 16-byte blocks. Padding is a concern
 /// of the mode's users, not of the proof, so it is not modelled here.
 pub fn encrypt(message: &[u8], secret_key: &[u8; 16]) -> Vec<u8> {
+    let (blocks, rest) = message.as_chunks::<16>();
     assert!(
-        message.len() % 16 == 0,
+        rest.is_empty(),
         "message must be a whole number of 16-byte blocks"
     );
     let cipher = Aes128::new(GenericArray::from_slice(secret_key));
 
-    message
-        .chunks_exact(16)
-        .flat_map(|chunk| {
-            let mut block = GenericArray::clone_from_slice(chunk);
+    blocks
+        .iter()
+        .flat_map(|block| {
+            let mut block = GenericArray::clone_from_slice(block);
             cipher.encrypt_block(&mut block);
             block.to_vec()
         })

@@ -51,7 +51,7 @@ impl AesEcbCircuit {
     /// simply unsatisfiable and no valid proof can be produced.
     pub fn prover(message: &[u8], secret_key: &[u8; 16], ciphertext: &[u8]) -> Result<Self> {
         ensure!(
-            !message.is_empty() && message.len() % 16 == 0,
+            !message.is_empty() && message.len().is_multiple_of(16),
             "message must be a non-empty multiple of 16 bytes, got {}",
             message.len()
         );

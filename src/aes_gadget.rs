@@ -77,10 +77,7 @@ pub fn key_schedule<F: PrimeField>(
     key: &State<F>,
     sbox: SboxKind,
 ) -> Result<RoundKeys<F>, SynthesisError> {
-    let mut words: Vec<[UInt8<F>; 4]> = key
-        .chunks_exact(4)
-        .map(|word| array::from_fn(|i| word[i].clone()))
-        .collect();
+    let mut words: Vec<[UInt8<F>; 4]> = key.as_chunks::<4>().0.to_vec();
 
     for i in 4..4 * (ROUNDS + 1) {
         let mut word = words[i - 1].clone();
