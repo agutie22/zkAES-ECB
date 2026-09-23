@@ -6,19 +6,20 @@ Built on **Arkworks 0.5**. No `simpleworks`, and no `ark-marlin` — whose last 
 
 ## The layers
 
-A SNARK over a circuit is a stack of independent pieces. Each is one module here, and each can be swapped without touching the others:
+Each layer is one module and depends only on the ones above it, so any of them can be read, tested or replaced on its own. Reading top to bottom is the intended order:
 
-| Layer | Where | What it does |
-| ----- | ----- | ------------ |
-| Field arithmetic | `ark-ff`, `ark-bls12-377` | the prime field `Fr` that everything is expressed in |
-| Gadgets | `ark-r1cs-std` | bytes and booleans as field variables, with XOR, AND, select |
-| Field extension | `src/gf256.rs` | GF(2⁸), the field AES itself is defined over |
-| Non-linear step | `src/sbox.rs` | the S-box, two ways — and ~90% of the circuit's cost |
-| Arithmetization | `src/aes_gadget.rs` | AES-128 ECB as constraints |
+| Layer | Module | What it does |
+| ----- | ------ | ------------ |
+| Specification | `src/reference.rs` | AES outside the circuit: what "correct" means |
+| Field arithmetic | `src/gf256.rs` | GF(2⁸), the field AES is defined over |
+| Non-linear step | `src/sbox.rs` | the S-box, two ways; ~75% of the circuit's cost |
+| Arithmetization | `src/aes_gadget.rs` | AES-128 ECB as constraints, one function per FIPS-197 step |
 | Relation | `src/circuit.rs` | what is proved: private message and key, public ciphertext |
-| Proving system | `src/backend/` | Groth16 or Spartan over that relation |
+| Proving system | `src/backend/` | Groth16 or Spartan, behind one `Backend` trait |
 
 Two notions of "field" meet in the middle of that table. AES is defined over GF(2⁸), with 256 elements; the proof system works over `Fr`, a prime field of about 2²⁵³ elements. The circuit does not embed one in the other — it represents each AES byte as eight `Fr` elements constrained to be 0 or 1, and rebuilds GF(2⁸) arithmetic out of XOR and AND on those bits. That is exactly why the S-box is expensive.
+
+To add a proving system, implement `Backend` (three methods: `setup`, `prove`, `verify`). Backends see only R1CS; they know nothing about AES.
 
 ### On PIOPs and polynomial commitments
 
@@ -41,41 +42,43 @@ Arkworks exposes the commitment layer on its own as `ark-poly-commit` (KZG, IPA,
 
 ## Usage
 
-`cargo run --release` runs the full Groth16 flow; see `src/main.rs`.
+`cargo run --release` proves one block with each backend and times every step; see `src/main.rs`.
 
 ```rust
-let ciphertext = /* output of a standard AES-128 ECB implementation */;
+use zk_aes::backend::{groth16::Groth16, Backend};
+use zk_aes::circuit::AesEcbCircuit;
+
+let ciphertext = zk_aes::reference::encrypt(&message, &secret_key);
 
 // Once per circuit shape (here, one 16-byte block).
-let (proving_key, verifying_key) = zk_aes::backend::groth16::setup(1, &mut rng)?;
+let (pk, vk) = Groth16::setup(AesEcbCircuit::setup(1), &mut rng)?;
 
 // Prover: knows the message and the key.
-let proof = zk_aes::backend::groth16::prove(
-    &proving_key, &message, &secret_key, &ciphertext, &mut rng,
-)?;
+let circuit = AesEcbCircuit::prover(&message, &secret_key, &ciphertext)?;
+let proof = Groth16::prove(&pk, circuit, &mut rng)?;
 
 // Verifier: sees only the verifying key, the ciphertext and the proof.
-assert!(zk_aes::backend::groth16::verify(&verifying_key, &ciphertext, &proof)?);
+let public_inputs = AesEcbCircuit::public_inputs(&ciphertext);
+assert!(Groth16::verify(&vk, &public_inputs, &proof)?);
 ```
 
-Other entry points:
+Swap `Groth16` for `Spartan` and nothing else changes.
 
 - **Circuit only, no proof**: `zk_aes::encrypt_circuit_only(&message, &secret_key)`
 - **Constraint count**: `zk_aes::constraint_count(num_blocks, sbox_kind)`
-- **Spartan (transparent)**: `zk_aes::backend::spartan::prove_and_verify(&message, &secret_key, &ciphertext)`
 
 Slow tests are `#[ignore]`d: run them with `cargo test --release -- --ignored`.
 
 ## Numbers
 
-One 16-byte block, release build, default (bitsliced) S-box:
+One 16-byte block, release build, bitsliced S-box: 30,728 constraints.
 
-| | | |
-| --- | --- | --- |
-| Constraints | 30,728 | was 184,928 with the lookup S-box |
-| Groth16 setup | ~0.9 s | ~4.4 s |
-| Groth16 prove | ~0.45 s | ~2.8 s |
-| Groth16 verify | ~5 ms | constant, independent of circuit size |
+| | Setup | Prove | Verify |
+| --- | --- | --- | --- |
+| Groth16 | ~1 s | ~0.5–0.7 s | ~5 ms |
+| Spartan | ~6 s | ~12 s | ~0.4 s |
+
+Groth16 wins on every axis here; what Spartan buys is a setup with no secrets in it.
 
 ## The S-box is the circuit
 

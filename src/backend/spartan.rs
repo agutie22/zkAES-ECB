@@ -1,161 +1,182 @@
 //! Spartan: a transparent SNARK, via `ark-spartan`.
 //!
-//! No trusted setup and no toxic waste; the cost is a proof that is
-//! logarithmically sized rather than constant, and slower verification.
+//! No trusted setup: [`Backend::setup`] only commits to the R1CS matrices, and
+//! anyone can recompute that commitment from the circuit. The cost is a larger
+//! proof and slower verification than Groth16.
 //!
-//! Internally this is a sum-check protocol over the multilinear extensions of
-//! the R1CS matrices, compiled with a multilinear polynomial commitment — but
-//! `ark-spartan` exposes the two as one `SNARK`, so all this module does is
-//! translate Arkworks' R1CS into the layout Spartan expects.
+//! Most of this module is layout translation. Arkworks orders a constraint
+//! row's variables as `[1, public inputs…, witness…]`; Spartan expects
+//! `[witness…, 1, public inputs…]`.
 
-use crate::circuit::AesEcbCircuit;
+use super::Backend;
 use crate::Fr;
 use anyhow::{anyhow, Result};
 use ark_bls12_377::G1Projective;
-use ark_ff::Zero;
-use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
-use libspartan::{InputsAssignment, Instance, SNARKGens, VarsAssignment, SNARK};
+use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem, SynthesisMode};
+use ark_std::rand::{CryptoRng, RngCore};
+use libspartan::{
+    ComputationCommitment, ComputationDecommitment, InputsAssignment, Instance, SNARKGens,
+    VarsAssignment, SNARK,
+};
 use merlin::Transcript;
+use std::sync::Arc;
 
-/// An R1CS instance and assignment, in Spartan's representation.
-pub struct SpartanInstance {
-    /// The matrices `A`, `B`, `C`.
-    pub inst: Instance<Fr>,
-    /// The private part of the assignment.
-    pub vars: VarsAssignment<Fr>,
-    /// The public part of the assignment: the ciphertext, bit by bit.
-    pub inputs: InputsAssignment<Fr>,
-    /// The largest number of non-zero entries across the three matrices.
-    pub num_non_zero: usize,
-    /// Number of constraints, i.e. matrix rows.
-    pub num_cons: usize,
-    /// Number of witness variables.
-    pub num_vars: usize,
-    /// Number of public inputs.
-    pub num_inputs: usize,
+/// Domain separator for the Fiat-Shamir transcript. Prover and verifier must
+/// agree on it.
+const TRANSCRIPT_LABEL: &[u8] = b"zk-aes-spartan";
+
+/// Spartan over BLS12-377's G1.
+pub struct Spartan;
+
+/// The public parameters and the commitment to the matrices, shared by both
+/// keys. Neither is secret.
+struct Shared {
+    gens: SNARKGens<G1Projective>,
+    commitment: ComputationCommitment<G1Projective>,
 }
 
-/// Synthesizes the circuit and translates the result into Spartan's form.
-///
-/// The translation is all in the column layout: Arkworks orders a row as
-/// `[1, public inputs…, witness…]`, Spartan as `[witness…, 1, public inputs…]`.
-pub fn build_instance(
-    message: &[u8],
-    secret_key: &[u8; 16],
-    ciphertext: &[u8],
-) -> Result<SpartanInstance> {
-    let cs = ConstraintSystem::<Fr>::new_ref();
-    let circuit = AesEcbCircuit::<Fr>::prover(message, secret_key, ciphertext)?;
-    circuit
-        .generate_constraints(cs.clone())
-        .map_err(|e| anyhow!("error generating constraints: {e}"))?;
+/// Spartan's proving key: the R1CS instance and the opening of its commitment.
+pub struct ProvingKey {
+    instance: Instance<Fr>,
+    decommitment: ComputationDecommitment<Fr>,
+    shared: Arc<Shared>,
+}
 
-    // Inline symbolic linear combinations so the matrices can be extracted.
-    cs.finalize();
-    let matrices = cs
-        .to_matrices()
-        .ok_or_else(|| anyhow!("constraint system matrices unavailable"))?;
+/// Spartan's verifying key: the public parameters and the commitment.
+pub struct VerifyingKey {
+    shared: Arc<Shared>,
+}
 
-    let num_cons = matrices.num_constraints;
-    let num_vars = matrices.num_witness_variables;
-    let num_inputs = matrices.num_instance_variables.saturating_sub(1);
-    let ark_num_instance = matrices.num_instance_variables;
+impl Backend for Spartan {
+    type ProvingKey = ProvingKey;
+    type VerifyingKey = VerifyingKey;
+    type Proof = SNARK<G1Projective>;
 
-    let to_spartan_column = |index: usize| -> usize {
-        if index == 0 {
-            num_vars // the constant 1
-        } else if index < ark_num_instance {
-            num_vars + index // public inputs, after the constant
-        } else {
-            index - ark_num_instance // witness variables, first
-        }
-    };
-
-    let convert = |rows: &[Vec<(Fr, usize)>]| -> Vec<(usize, usize, Fr)> {
-        let mut out = Vec::new();
-        for (row, entries) in rows.iter().enumerate() {
-            for (coefficient, index) in entries {
-                if !coefficient.is_zero() {
-                    out.push((row, to_spartan_column(*index), *coefficient));
-                }
-            }
-        }
-        out
-    };
-
-    let (mat_a, mat_b, mat_c) = (
-        convert(&matrices.a),
-        convert(&matrices.b),
-        convert(&matrices.c),
-    );
-
-    let num_non_zero = matrices
-        .a_num_non_zero
-        .max(matrices.b_num_non_zero)
-        .max(matrices.c_num_non_zero);
-
-    let borrowed = cs
-        .borrow()
-        .ok_or_else(|| anyhow!("error borrowing constraint system"))?;
-    let witness = borrowed.witness_assignment.clone();
-    let mut public: Vec<Fr> = borrowed.instance_assignment.iter().skip(1).copied().collect();
-    public.resize(num_inputs, Fr::zero());
-    drop(borrowed);
-
-    let inst = Instance::new(num_cons, num_vars, num_inputs, &mat_a, &mat_b, &mat_c)
-        .map_err(|e| anyhow!(format!("{e:?}")))?;
-    let vars = VarsAssignment::new(&witness).map_err(|e| anyhow!(format!("{e:?}")))?;
-    let inputs = InputsAssignment::new(&public).map_err(|e| anyhow!(format!("{e:?}")))?;
-
-    if !inst
-        .is_sat(&vars, &inputs)
-        .map_err(|e| anyhow!(format!("{e:?}")))?
+    fn setup<C, R>(circuit: C, _rng: &mut R) -> Result<(Self::ProvingKey, Self::VerifyingKey)>
+    where
+        C: ConstraintSynthesizer<Fr>,
+        R: RngCore + CryptoRng,
     {
-        return Err(anyhow!("constructed Spartan instance is not satisfiable"));
+        // Synthesize the shape only, and read the matrices off it.
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        cs.set_mode(SynthesisMode::Setup);
+        circuit
+            .generate_constraints(cs.clone())
+            .map_err(|e| anyhow!("error generating constraints: {e}"))?;
+        cs.finalize();
+        let matrices = cs
+            .to_matrices()
+            .ok_or_else(|| anyhow!("constraint matrices unavailable"))?;
+
+        let num_witness = matrices.num_witness_variables;
+        let num_public = matrices.num_instance_variables - 1;
+
+        // Arkworks column -> Spartan column.
+        let column = |index: usize| {
+            if index == 0 {
+                num_witness // the constant 1
+            } else if index <= num_public {
+                num_witness + index // public inputs follow the constant
+            } else {
+                index - num_public - 1 // witness variables come first
+            }
+        };
+        let to_spartan = |rows: &[Vec<(Fr, usize)>]| -> Vec<(usize, usize, Fr)> {
+            rows.iter()
+                .enumerate()
+                .flat_map(|(row, entries)| {
+                    entries
+                        .iter()
+                        .map(move |(value, index)| (row, column(*index), *value))
+                })
+                .collect()
+        };
+
+        let instance = Instance::new(
+            matrices.num_constraints,
+            num_witness,
+            num_public,
+            &to_spartan(&matrices.a),
+            &to_spartan(&matrices.b),
+            &to_spartan(&matrices.c),
+        )
+        .map_err(|e| anyhow!("error building the Spartan instance: {e:?}"))?;
+
+        let num_non_zero = matrices
+            .a_num_non_zero
+            .max(matrices.b_num_non_zero)
+            .max(matrices.c_num_non_zero);
+        let gens = SNARKGens::new(
+            matrices.num_constraints,
+            num_witness,
+            num_public,
+            num_non_zero,
+        );
+        let (commitment, decommitment) = SNARK::encode(&instance, &gens);
+
+        let shared = Arc::new(Shared { gens, commitment });
+        Ok((
+            ProvingKey {
+                instance,
+                decommitment,
+                shared: Arc::clone(&shared),
+            },
+            VerifyingKey { shared },
+        ))
     }
 
-    Ok(SpartanInstance {
-        inst,
-        vars,
-        inputs,
-        num_non_zero,
-        num_cons,
-        num_vars,
-        num_inputs,
-    })
-}
+    fn prove<C, R>(proving_key: &Self::ProvingKey, circuit: C, _rng: &mut R) -> Result<Self::Proof>
+    where
+        C: ConstraintSynthesizer<Fr>,
+        R: RngCore + CryptoRng,
+    {
+        // Synthesize with values, keeping only the assignment. The matrices
+        // were fixed at setup.
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        cs.set_mode(SynthesisMode::Prove {
+            construct_matrices: false,
+        });
+        circuit
+            .generate_constraints(cs.clone())
+            .map_err(|e| anyhow!("error generating constraints: {e}"))?;
 
-/// Proves and verifies in one call. There is no setup to separate out: the
-/// public parameters here depend only on the circuit's size, not on secrets.
-pub fn prove_and_verify(
-    message: &[u8],
-    secret_key: &[u8; 16],
-    ciphertext: &[u8],
-) -> Result<bool> {
-    let instance = build_instance(message, secret_key, ciphertext)?;
+        let (witness, public) = {
+            let cs = cs
+                .borrow()
+                .ok_or_else(|| anyhow!("error reading the assignment"))?;
+            (
+                cs.witness_assignment.clone(),
+                cs.instance_assignment[1..].to_vec(),
+            )
+        };
+        let witness = VarsAssignment::new(&witness).map_err(|e| anyhow!("{e:?}"))?;
+        let public = InputsAssignment::new(&public).map_err(|e| anyhow!("{e:?}"))?;
 
-    let gens = SNARKGens::<G1Projective>::new(
-        instance.num_cons,
-        instance.num_vars,
-        instance.num_inputs,
-        instance.num_non_zero,
-    );
+        Ok(SNARK::prove(
+            &proving_key.instance,
+            &proving_key.shared.commitment,
+            &proving_key.decommitment,
+            witness,
+            &public,
+            &proving_key.shared.gens,
+            &mut Transcript::new(TRANSCRIPT_LABEL),
+        ))
+    }
 
-    let (comm, decomm) = SNARK::<G1Projective>::encode(&instance.inst, &gens);
+    fn verify(
+        verifying_key: &Self::VerifyingKey,
+        public_inputs: &[Fr],
+        proof: &Self::Proof,
+    ) -> Result<bool> {
+        let public = InputsAssignment::new(public_inputs).map_err(|e| anyhow!("{e:?}"))?;
 
-    let mut prover_transcript = Transcript::new(b"zk-aes-spartan");
-    let proof = SNARK::prove(
-        &instance.inst,
-        &comm,
-        &decomm,
-        instance.vars,
-        &instance.inputs,
-        &gens,
-        &mut prover_transcript,
-    );
-
-    let mut verifier_transcript = Transcript::new(b"zk-aes-spartan");
-    Ok(proof
-        .verify(&comm, &instance.inputs, &mut verifier_transcript, &gens)
-        .is_ok())
+        Ok(proof
+            .verify(
+                &verifying_key.shared.commitment,
+                &public,
+                &mut Transcript::new(TRANSCRIPT_LABEL),
+                &verifying_key.shared.gens,
+            )
+            .is_ok())
+    }
 }

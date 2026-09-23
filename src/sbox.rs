@@ -2,14 +2,14 @@
 //! whole circuit, since `SubBytes` runs 200 times per block (160 in the rounds,
 //! 40 in the key schedule).
 //!
-//! Two implementations are available, and they are interchangeable: see
+//! Two constructions are available, and they are interchangeable: see
 //! [`SboxKind`]. Everything else in the circuit is independent of this choice.
 
 use ark_ff::PrimeField;
 use ark_r1cs_std::{
     convert::ToBitsGadget, prelude::Boolean, select::CondSelectGadget, uint8::UInt8,
 };
-use ark_relations::r1cs::{ConstraintSystemRef, SynthesisError};
+use ark_relations::r1cs::SynthesisError;
 
 /// The Rijndael S-box, as a plain table.
 pub const SBOX: [u8; 256] = [
@@ -42,46 +42,16 @@ pub enum SboxKind {
     Lookup,
 }
 
-/// An S-box ready to be applied to bytes.
-///
-/// [`SboxKind::Lookup`] needs the table allocated as circuit constants once, up
-/// front, which is why this is a value and not a free function.
-pub struct Sbox<F: PrimeField> {
-    kind: SboxKind,
-    table: Vec<UInt8<F>>,
-}
-
-impl<F: PrimeField> Sbox<F> {
-    /// Prepares an S-box of the given kind.
-    pub fn new(kind: SboxKind, cs: ConstraintSystemRef<F>) -> Self {
-        let _ = cs;
-        let table = match kind {
-            SboxKind::Lookup => UInt8::constant_vec(&SBOX),
-            SboxKind::Bitsliced => Vec::new(),
-        };
-        Self { kind, table }
-    }
-
+impl SboxKind {
     /// Applies the S-box to one byte.
-    pub fn substitute(&self, byte: &UInt8<F>) -> Result<UInt8<F>, SynthesisError> {
-        match self.kind {
-            SboxKind::Bitsliced => {
-                let bits: [Boolean<F>; 8] = byte
-                    .to_bits_le()?
-                    .try_into()
-                    .map_err(|_| SynthesisError::Unsatisfiable)?;
-                Ok(UInt8::from_bits_le(&bitsliced(&bits)))
-            },
-            SboxKind::Lookup => UInt8::conditionally_select_power_of_two_vector(
+    pub fn apply<F: PrimeField>(self, byte: &UInt8<F>) -> Result<UInt8<F>, SynthesisError> {
+        match self {
+            Self::Bitsliced => Ok(UInt8::from_bits_le(&bitsliced(&byte.bits))),
+            Self::Lookup => UInt8::conditionally_select_power_of_two_vector(
                 &byte.to_bits_be()?,
-                &self.table,
+                &UInt8::constant_vec(&SBOX),
             ),
         }
-    }
-
-    /// Applies the S-box to each byte of a state.
-    pub fn substitute_bytes(&self, bytes: &[UInt8<F>]) -> Result<Vec<UInt8<F>>, SynthesisError> {
-        bytes.iter().map(|byte| self.substitute(byte)).collect()
     }
 }
 
@@ -225,17 +195,19 @@ mod tests {
     use ark_r1cs_std::{prelude::AllocVar, R1CSVar};
     use ark_relations::r1cs::ConstraintSystem;
 
-    /// Both implementations must agree with the Rijndael table on every input.
+    /// Both constructions must agree with the Rijndael table on every input.
     fn agrees_with_the_table(kind: SboxKind) {
         let cs = ConstraintSystem::<Fr>::new_ref();
-        let sbox = Sbox::new(kind, cs.clone());
 
-        for (input, expected) in SBOX.iter().enumerate() {
-            let byte = u8::try_from(input).unwrap();
+        for byte in 0_u8..=255 {
             let gadget = UInt8::new_witness(cs.clone(), || Ok(byte)).unwrap();
-            let substituted = sbox.substitute(&gadget).unwrap();
+            let substituted = kind.apply(&gadget).unwrap();
 
-            assert_eq!(substituted.value().unwrap(), *expected, "S-box({byte:#04x})");
+            assert_eq!(
+                substituted.value().unwrap(),
+                SBOX[usize::from(byte)],
+                "{kind:?}({byte:#04x})"
+            );
         }
 
         assert!(cs.is_satisfied().unwrap());
@@ -251,26 +223,18 @@ mod tests {
         agrees_with_the_table(SboxKind::Lookup);
     }
 
-    /// Records the per-byte cost of each construction, and asserts the bitsliced
-    /// one is the cheaper of the two by a wide margin.
+    /// Pins the per-byte cost of each construction.
     #[test]
-    fn bitsliced_is_far_cheaper_than_the_lookup() {
-        let cost = |kind| {
+    fn constraints_per_byte() {
+        let cost = |kind: SboxKind| {
             let cs = ConstraintSystem::<Fr>::new_ref();
-            let sbox = Sbox::<Fr>::new(kind, cs.clone());
             let byte = UInt8::new_witness(cs.clone(), || Ok(0x53_u8)).unwrap();
             let before = cs.num_constraints();
-            sbox.substitute(&byte).unwrap();
+            kind.apply(&byte).unwrap();
             cs.num_constraints() - before
         };
 
-        let bitsliced = cost(SboxKind::Bitsliced);
-        let lookup = cost(SboxKind::Lookup);
-        println!("constraints per S-box: bitsliced={bitsliced}, lookup={lookup}");
-
-        assert!(
-            bitsliced * 4 < lookup,
-            "expected the bitsliced S-box to be much cheaper, got {bitsliced} vs {lookup}"
-        );
+        assert_eq!(cost(SboxKind::Bitsliced), 113);
+        assert_eq!(cost(SboxKind::Lookup), 884);
     }
 }

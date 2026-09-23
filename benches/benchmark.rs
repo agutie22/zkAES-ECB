@@ -1,23 +1,32 @@
+//! Groth16 proving time by message length. Setup runs outside the measured
+//! loop, since it happens once per circuit shape.
+
 use criterion::{criterion_group, criterion_main, Criterion};
-#[cfg(feature = "benchmark_flamegraph")]
-use pprof::criterion::PProfProfiler;
+use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+use zk_aes::backend::{groth16::Groth16, Backend};
+use zk_aes::circuit::AesEcbCircuit;
 
-mod benchmark_encrypt;
+fn prove(c: &mut Criterion) {
+    let mut rng = ChaCha20Rng::seed_from_u64(0);
+    let key = [0_u8; 16];
 
-fn run_benchmarks(c: &mut Criterion) {
-    benchmark_encrypt::encrypt_message_with_bytes(c, 16).unwrap();
-    benchmark_encrypt::encrypt_message_with_bytes(c, 32).unwrap();
-    benchmark_encrypt::encrypt_message_with_bytes(c, 64).unwrap();
+    for num_blocks in [1, 2, 4] {
+        let message = vec![1_u8; 16 * num_blocks];
+        let ciphertext = zk_aes::reference::encrypt(&message, &key);
+        let (pk, _) = Groth16::setup(AesEcbCircuit::setup(num_blocks), &mut rng).unwrap();
+
+        c.bench_function(&format!("groth16_prove_{num_blocks}_blocks"), |b| {
+            b.iter(|| {
+                let circuit = AesEcbCircuit::prover(&message, &key, &ciphertext).unwrap();
+                Groth16::prove(&pk, circuit, &mut rng).unwrap()
+            })
+        });
+    }
 }
 
-#[cfg(feature = "benchmark_flamegraph")]
 criterion_group! {
     name = benches;
-    config = Criterion::default().with_profiler(PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
-    targets = run_benchmarks
+    config = Criterion::default().sample_size(10);
+    targets = prove
 }
-
-#[cfg(not(feature = "benchmark_flamegraph"))]
-criterion_group!(benches, run_benchmarks);
-
 criterion_main!(benches);

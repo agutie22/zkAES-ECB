@@ -1,59 +1,64 @@
-use aes::{
-    cipher::{BlockEncrypt, KeyInit},
-    Aes128,
-};
-use anyhow::Result;
-use digest::generic_array::GenericArray;
-use rand::SeedableRng;
-use rand_chacha::ChaCha20Rng;
+//! Proves one AES-128 block with each backend, and times every step.
+
+use anyhow::{ensure, Result};
+use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use std::time::Instant;
+use zk_aes::backend::{groth16::Groth16, spartan::Spartan, Backend};
+use zk_aes::circuit::AesEcbCircuit;
+use zk_aes::sbox::SboxKind;
 
 fn main() -> Result<()> {
     let message = [1_u8; 16];
     let secret_key = [0_u8; 16];
-    let primitive_secret_key = Aes128::new(GenericArray::from_slice(&secret_key));
+    let ciphertext = zk_aes::reference::encrypt(&message, &secret_key);
 
-    // The ciphertext the verifier will be given, computed with a standard AES.
-    let ciphertext = primitive_encrypt(&message, &primitive_secret_key);
+    ensure!(zk_aes::encrypt_circuit_only(&message, &secret_key)? == ciphertext);
+    println!(
+        "circuit matches the reference AES ({} constraints)",
+        zk_aes::constraint_count(1, SboxKind::default())?
+    );
 
-    // The circuit computes the same thing.
-    let circuit_ciphertext = zk_aes::encrypt_circuit_only(&message, &secret_key)?;
-    assert_eq!(ciphertext, circuit_ciphertext);
-    println!("circuit output matches the `aes` crate");
-
-    // Groth16: setup once per circuit shape, then prove, then verify.
-    // A seeded RNG keeps this demo reproducible; a real setup needs a ceremony.
-    let mut rng = ChaCha20Rng::seed_from_u64(0_u64);
-
-    let start = Instant::now();
-    let (proving_key, verifying_key) = zk_aes::backend::groth16::setup(1_usize, &mut rng)?;
-    println!("groth16 setup:  {:?}", start.elapsed());
-
-    let start = Instant::now();
-    let proof = zk_aes::backend::groth16::prove(&proving_key, &message, &secret_key, &ciphertext, &mut rng)?;
-    println!("groth16 prove:  {:?}", start.elapsed());
-
-    // The verifier only ever sees these three things.
-    let start = Instant::now();
-    let verified = zk_aes::backend::groth16::verify(&verifying_key, &ciphertext, &proof)?;
-    println!("groth16 verify: {:?} -> {verified}", start.elapsed());
-    assert!(verified);
-
-    // The same proof must not verify against a different ciphertext.
-    let mut tampered = ciphertext.clone();
-    if let Some(byte) = tampered.get_mut(0) {
-        *byte ^= 1_u8;
-    }
-    assert!(!zk_aes::backend::groth16::verify(&verifying_key, &tampered, &proof)?);
-    println!("proof correctly rejected for a tampered ciphertext");
-
+    run::<Groth16>("groth16", &message, &secret_key, &ciphertext)?;
+    run::<Spartan>("spartan", &message, &secret_key, &ciphertext)?;
     Ok(())
 }
 
-fn primitive_encrypt(message: &[u8; 16], primitive_secret_key: &Aes128) -> Vec<u8> {
-    let mut encrypted_message = Vec::new();
-    let mut block = GenericArray::clone_from_slice(message);
-    primitive_secret_key.encrypt_block(&mut block);
-    encrypted_message.extend_from_slice(block.as_slice());
-    encrypted_message
+/// Setup, prove, verify, then check that a tampered ciphertext is rejected.
+fn run<B: Backend>(
+    name: &str,
+    message: &[u8],
+    secret_key: &[u8; 16],
+    ciphertext: &[u8],
+) -> Result<()> {
+    // A seeded RNG keeps the demo reproducible. A real setup needs real entropy.
+    let mut rng = ChaCha20Rng::seed_from_u64(0);
+
+    let start = Instant::now();
+    let (proving_key, verifying_key) = B::setup(AesEcbCircuit::setup(1), &mut rng)?;
+    let setup = start.elapsed();
+
+    let start = Instant::now();
+    let circuit = AesEcbCircuit::prover(message, secret_key, ciphertext)?;
+    let proof = B::prove(&proving_key, circuit, &mut rng)?;
+    let prove = start.elapsed();
+
+    let start = Instant::now();
+    let public_inputs = AesEcbCircuit::public_inputs(ciphertext);
+    let verified = B::verify(&verifying_key, &public_inputs, &proof)?;
+    let verify = start.elapsed();
+
+    let mut tampered = ciphertext.to_vec();
+    tampered[0] ^= 1;
+    let rejected = !B::verify(
+        &verifying_key,
+        &AesEcbCircuit::public_inputs(&tampered),
+        &proof,
+    )?;
+
+    println!(
+        "{name:8} setup {setup:>10.2?}   prove {prove:>10.2?}   verify {verify:>10.2?}   \
+         verified={verified} tampered-rejected={rejected}"
+    );
+    ensure!(verified && rejected, "{name} failed");
+    Ok(())
 }
